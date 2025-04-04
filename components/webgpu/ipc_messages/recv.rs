@@ -9,13 +9,13 @@ use arrayvec::ArrayVec;
 use base::id::PipelineId;
 use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
 use serde::{Deserialize, Serialize};
-use webrender_api::units::DeviceIntSize;
 use webrender_api::ImageKey;
+use webrender_api::units::DeviceIntSize;
 use wgc::binding_model::{
     BindGroupDescriptor, BindGroupLayoutDescriptor, PipelineLayoutDescriptor,
 };
 use wgc::command::{
-    ImageCopyBuffer, ImageCopyTexture, RenderBundleDescriptor, RenderBundleEncoder,
+    RenderBundleDescriptor, RenderBundleEncoder, TexelCopyBufferInfo, TexelCopyTextureInfo,
 };
 use wgc::device::HostMap;
 use wgc::id;
@@ -24,15 +24,20 @@ use wgc::pipeline::{ComputePipelineDescriptor, RenderPipelineDescriptor};
 use wgc::resource::{
     BufferDescriptor, SamplerDescriptor, TextureDescriptor, TextureViewDescriptor,
 };
+use wgpu_core::Label;
 use wgpu_core::command::{RenderPassColorAttachment, RenderPassDepthStencilAttachment};
 use wgpu_core::id::AdapterId;
-use wgpu_core::Label;
 pub use {wgpu_core as wgc, wgpu_types as wgt};
 
 use crate::identity::*;
 use crate::render_commands::RenderCommand;
 use crate::swapchain::WebGPUContextId;
-use crate::{Error, ErrorFilter, Mapping, WebGPUResponse, PRESENTATION_BUFFER_COUNT};
+use crate::wgc::resource::BufferAccessError;
+use crate::{
+    Error, ErrorFilter, Mapping, PRESENTATION_BUFFER_COUNT, ShaderCompilationInfo,
+    WebGPUAdapterResponse, WebGPUComputePipelineResponse, WebGPUDeviceResponse,
+    WebGPUPoppedErrorScopeResponse, WebGPURenderPipelineResponse,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct ContextConfiguration {
@@ -45,7 +50,7 @@ pub struct ContextConfiguration {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum WebGPURequest {
     BufferMapAsync {
-        sender: IpcSender<WebGPUResponse>,
+        sender: IpcSender<Result<Mapping, BufferAccessError>>,
         buffer_id: id::BufferId,
         device_id: id::DeviceId,
         host_map: HostMap,
@@ -67,20 +72,20 @@ pub enum WebGPURequest {
     },
     CopyBufferToTexture {
         command_encoder_id: id::CommandEncoderId,
-        source: ImageCopyBuffer,
-        destination: ImageCopyTexture,
+        source: TexelCopyBufferInfo,
+        destination: TexelCopyTextureInfo,
         copy_size: wgt::Extent3d,
     },
     CopyTextureToBuffer {
         command_encoder_id: id::CommandEncoderId,
-        source: ImageCopyTexture,
-        destination: ImageCopyBuffer,
+        source: TexelCopyTextureInfo,
+        destination: TexelCopyBufferInfo,
         copy_size: wgt::Extent3d,
     },
     CopyTextureToTexture {
         command_encoder_id: id::CommandEncoderId,
-        source: ImageCopyTexture,
-        destination: ImageCopyTexture,
+        source: TexelCopyTextureInfo,
+        destination: TexelCopyTextureInfo,
         copy_size: wgt::Extent3d,
     },
     CreateBindGroup {
@@ -109,7 +114,7 @@ pub enum WebGPURequest {
         descriptor: ComputePipelineDescriptor<'static>,
         implicit_ids: Option<(id::PipelineLayoutId, Vec<id::BindGroupLayoutId>)>,
         /// present only on ASYNC versions
-        async_sender: Option<IpcSender<WebGPUResponse>>,
+        async_sender: Option<IpcSender<WebGPUComputePipelineResponse>>,
     },
     CreatePipelineLayout {
         device_id: id::DeviceId,
@@ -122,7 +127,7 @@ pub enum WebGPURequest {
         descriptor: RenderPipelineDescriptor<'static>,
         implicit_ids: Option<(id::PipelineLayoutId, Vec<id::BindGroupLayoutId>)>,
         /// present only on ASYNC versions
-        async_sender: Option<IpcSender<WebGPUResponse>>,
+        async_sender: Option<IpcSender<WebGPURenderPipelineResponse>>,
     },
     CreateSampler {
         device_id: id::DeviceId,
@@ -134,7 +139,7 @@ pub enum WebGPURequest {
         program_id: id::ShaderModuleId,
         program: String,
         label: Option<String>,
-        sender: IpcSender<WebGPUResponse>,
+        sender: IpcSender<Option<ShaderCompilationInfo>>,
     },
     /// Creates context
     CreateContext {
@@ -153,6 +158,11 @@ pub enum WebGPURequest {
         context_id: WebGPUContextId,
         texture_id: id::TextureId,
         encoder_id: id::CommandEncoderId,
+    },
+    /// Obtains image from latest presentation buffer (same as wr update)
+    GetImage {
+        context_id: WebGPUContextId,
+        sender: IpcSender<IpcSharedMemory>,
     },
     ValidateTextureDescriptor {
         device_id: id::DeviceId,
@@ -201,12 +211,12 @@ pub enum WebGPURequest {
         device_id: id::DeviceId,
     },
     RequestAdapter {
-        sender: IpcSender<WebGPUResponse>,
+        sender: IpcSender<WebGPUAdapterResponse>,
         options: RequestAdapterOptions,
         adapter_id: AdapterId,
     },
     RequestDevice {
-        sender: IpcSender<WebGPUResponse>,
+        sender: IpcSender<WebGPUDeviceResponse>,
         adapter_id: WebGPUAdapter,
         descriptor: wgt::DeviceDescriptor<Option<String>>,
         device_id: id::DeviceId,
@@ -289,13 +299,13 @@ pub enum WebGPURequest {
     WriteTexture {
         device_id: id::DeviceId,
         queue_id: id::QueueId,
-        texture_cv: ImageCopyTexture,
-        data_layout: wgt::ImageDataLayout,
+        texture_cv: TexelCopyTextureInfo,
+        data_layout: wgt::TexelCopyBufferLayout,
         size: wgt::Extent3d,
         data: IpcSharedMemory,
     },
     QueueOnSubmittedWorkDone {
-        sender: IpcSender<WebGPUResponse>,
+        sender: IpcSender<()>,
         queue_id: id::QueueId,
     },
     PushErrorScope {
@@ -308,7 +318,7 @@ pub enum WebGPURequest {
     },
     PopErrorScope {
         device_id: id::DeviceId,
-        sender: IpcSender<WebGPUResponse>,
+        sender: IpcSender<WebGPUPoppedErrorScopeResponse>,
     },
     ComputeGetBindGroupLayout {
         device_id: id::DeviceId,

@@ -11,15 +11,13 @@ mod browsingcontext;
 mod constellation;
 mod event_loop;
 mod logging;
-mod network_listener;
 mod pipeline;
 mod sandboxing;
 mod serviceworker;
 mod session_history;
-mod timer_scheduler;
 mod webview;
 
 pub use crate::constellation::{Constellation, InitialConstellationState};
 pub use crate::logging::{FromCompositorLogger, FromScriptLogger};
 pub use crate::pipeline::UnprivilegedPipelineContent;
-pub use crate::sandboxing::{content_process_sandbox_profile, UnprivilegedContent};
+pub use crate::sandboxing::{UnprivilegedContent, content_process_sandbox_profile};

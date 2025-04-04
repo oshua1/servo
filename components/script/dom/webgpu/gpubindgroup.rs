@@ -8,19 +8,21 @@ use dom_struct::dom_struct;
 use webgpu::wgc::binding_model::BindGroupDescriptor;
 use webgpu::{WebGPU, WebGPUBindGroup, WebGPUDevice, WebGPURequest};
 
+use crate::conversions::Convert;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUBindGroupDescriptor, GPUBindGroupMethods,
 };
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::webgpu::gpubindgrouplayout::GPUBindGroupLayout;
 use crate::dom::webgpu::gpudevice::GPUDevice;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct GPUBindGroup {
+pub(crate) struct GPUBindGroup {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "channels are hard"]
     #[no_trace]
@@ -51,41 +53,44 @@ impl GPUBindGroup {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         channel: WebGPU,
         bind_group: WebGPUBindGroup,
         device: WebGPUDevice,
         layout: &GPUBindGroupLayout,
         label: USVString,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPUBindGroup::new_inherited(
                 channel, bind_group, device, layout, label,
             )),
             global,
+            can_gc,
         )
     }
 }
 
 impl GPUBindGroup {
-    pub fn id(&self) -> &WebGPUBindGroup {
+    pub(crate) fn id(&self) -> &WebGPUBindGroup {
         &self.bind_group
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createbindgroup>
-    pub fn create(
+    pub(crate) fn create(
         device: &GPUDevice,
         descriptor: &GPUBindGroupDescriptor,
+        can_gc: CanGc,
     ) -> DomRoot<GPUBindGroup> {
         let entries = descriptor
             .entries
             .iter()
-            .map(|bind| bind.into())
+            .map(|bind| bind.convert())
             .collect::<Vec<_>>();
 
         let desc = BindGroupDescriptor {
-            label: (&descriptor.parent).into(),
+            label: (&descriptor.parent).convert(),
             layout: descriptor.layout.id().0,
             entries: Cow::Owned(entries),
         };
@@ -110,6 +115,7 @@ impl GPUBindGroup {
             device.id(),
             &descriptor.layout,
             descriptor.parent.label.clone(),
+            can_gc,
         )
     }
 }

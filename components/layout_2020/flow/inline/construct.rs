@@ -6,13 +6,14 @@ use std::borrow::Cow;
 use std::char::{ToLowercase, ToUppercase};
 
 use icu_segmenter::WordSegmenter;
+use servo_arc::Arc;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
-use style::values::computed::TextDecorationLine;
 use style::values::specified::text::TextTransformCase;
 use unicode_bidi::Level;
 
 use super::text_run::TextRun;
 use super::{InlineBox, InlineBoxIdentifier, InlineBoxes, InlineFormattingContext, InlineItem};
+use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::NodeExt;
@@ -124,7 +125,7 @@ impl InlineFormattingContextBuilder {
         independent_formatting_context: IndependentFormattingContext,
     ) -> ArcRefCell<InlineItem> {
         let inline_level_box = ArcRefCell::new(InlineItem::Atomic(
-            independent_formatting_context,
+            Arc::new(independent_formatting_context),
             self.current_text_offset,
             Level::ltr(), /* This will be assigned later if necessary. */
         ));
@@ -155,19 +156,20 @@ impl InlineFormattingContextBuilder {
     }
 
     pub(crate) fn push_float_box(&mut self, float_box: FloatBox) -> ArcRefCell<InlineItem> {
-        let inline_level_box = ArcRefCell::new(InlineItem::OutOfFlowFloatBox(float_box));
+        let inline_level_box = ArcRefCell::new(InlineItem::OutOfFlowFloatBox(Arc::new(float_box)));
         self.inline_items.push(inline_level_box.clone());
         self.contains_floats = true;
         inline_level_box
     }
 
-    pub(crate) fn start_inline_box(&mut self, inline_box: InlineBox) {
+    pub(crate) fn start_inline_box(&mut self, inline_box: InlineBox) -> ArcRefCell<InlineItem> {
         self.push_control_character_string(inline_box.style.bidi_control_chars().0);
 
-        let identifier = self.inline_boxes.start_inline_box(inline_box);
-        self.inline_items
-            .push(ArcRefCell::new(InlineItem::StartInlineBox(identifier)));
+        let (identifier, inline_box) = self.inline_boxes.start_inline_box(inline_box);
+        let inline_level_box = ArcRefCell::new(InlineItem::StartInlineBox(inline_box));
+        self.inline_items.push(inline_level_box.clone());
         self.inline_box_stack.push(identifier);
+        inline_level_box
     }
 
     pub(crate) fn end_inline_box(&mut self) -> ArcRefCell<InlineBox> {
@@ -230,13 +232,12 @@ impl InlineFormattingContextBuilder {
 
         let white_space_collapse = info.style.clone_white_space_collapse();
         let new_text: String = char_iterator
-            .map(|character| {
+            .inspect(|&character| {
                 self.has_uncollapsible_text_content |= matches!(
                     white_space_collapse,
                     WhiteSpaceCollapse::Preserve | WhiteSpaceCollapse::BreakSpaces
                 ) || !character.is_ascii_whitespace() ||
                     (character == '\n' && white_space_collapse != WhiteSpaceCollapse::Collapse);
-                character
             })
             .collect();
 
@@ -256,23 +257,21 @@ impl InlineFormattingContextBuilder {
 
         if let Some(inline_item) = self.inline_items.last() {
             if let InlineItem::TextRun(text_run) = &mut *inline_item.borrow_mut() {
-                text_run.text_range.end = new_range.end;
+                text_run.borrow_mut().text_range.end = new_range.end;
                 return;
             }
         }
 
         self.inline_items
-            .push(ArcRefCell::new(InlineItem::TextRun(TextRun::new(
-                info.into(),
-                info.style.clone(),
-                new_range,
+            .push(ArcRefCell::new(InlineItem::TextRun(ArcRefCell::new(
+                TextRun::new(info.into(), info.style.clone(), new_range),
             ))));
     }
 
     pub(crate) fn split_around_block_and_finish(
         &mut self,
         layout_context: &LayoutContext,
-        text_decoration_line: TextDecorationLine,
+        propagated_data: PropagatedBoxTreeData,
         has_first_formatted_line: bool,
         default_bidi_level: Level,
     ) -> Option<InlineFormattingContext> {
@@ -304,7 +303,7 @@ impl InlineFormattingContextBuilder {
 
         inline_builder_from_before_split.finish(
             layout_context,
-            text_decoration_line,
+            propagated_data,
             has_first_formatted_line,
             /* is_single_line_text_input = */ false,
             default_bidi_level,
@@ -315,7 +314,7 @@ impl InlineFormattingContextBuilder {
     pub(crate) fn finish(
         &mut self,
         layout_context: &LayoutContext,
-        text_decoration_line: TextDecorationLine,
+        propagated_data: PropagatedBoxTreeData,
         has_first_formatted_line: bool,
         is_single_line_text_input: bool,
         default_bidi_level: Level,
@@ -330,7 +329,7 @@ impl InlineFormattingContextBuilder {
         Some(InlineFormattingContext::new_with_builder(
             old_builder,
             layout_context,
-            text_decoration_line,
+            propagated_data,
             has_first_formatted_line,
             is_single_line_text_input,
             default_bidi_level,

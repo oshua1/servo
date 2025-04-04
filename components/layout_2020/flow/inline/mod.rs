@@ -48,8 +48,8 @@
 //! a linear series of items that describe the line's hierarchy of inline boxes and content. The
 //! item types are:
 //!
-//!  - [`LineItem::LeftInlineBoxPaddingBorderMargin`]
-//!  - [`LineItem::RightInlineBoxPaddingBorderMargin`]
+//!  - [`LineItem::InlineStartBoxPaddingBorderMargin`]
+//!  - [`LineItem::InlineEndBoxPaddingBorderMargin`]
 //!  - [`LineItem::TextRun`]
 //!  - [`LineItem::Atomic`]
 //!  - [`LineItem::AbsolutelyPositioned`]
@@ -88,37 +88,38 @@ use line::{
     TextRunLineItem,
 };
 use line_breaker::LineBreaker;
-use serde::Serialize;
 use servo_arc::Arc;
+use style::Zero;
 use style::computed_values::text_wrap_mode::T as TextWrapMode;
 use style::computed_values::vertical_align::T as VerticalAlign;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::context::QuirksMode;
-use style::properties::style_structs::InheritedText;
 use style::properties::ComputedValues;
+use style::properties::style_structs::InheritedText;
 use style::values::generics::box_::VerticalAlignKeyword;
 use style::values::generics::font::LineHeight;
 use style::values::specified::box_::BaselineSource;
 use style::values::specified::text::{TextAlignKeyword, TextDecorationLine};
 use style::values::specified::{TextAlignLast, TextJustify};
-use style::Zero;
 use text_run::{
-    add_or_get_font, get_font_for_first_font_for_style, TextRun, XI_LINE_BREAKING_CLASS_GL,
-    XI_LINE_BREAKING_CLASS_WJ, XI_LINE_BREAKING_CLASS_ZWJ,
+    TextRun, XI_LINE_BREAKING_CLASS_GL, XI_LINE_BREAKING_CLASS_WJ, XI_LINE_BREAKING_CLASS_ZWJ,
+    add_or_get_font, get_font_for_first_font_for_style,
 };
 use unicode_bidi::{BidiInfo, Level};
 use webrender_api::FontInstanceKey;
 use xi_unicode::linebreak_property;
 
 use super::float::{Clear, PlacementAmongFloats};
-use super::IndependentFormattingContextContents;
+use super::{
+    CacheableLayoutResult, IndependentFloatOrAtomicLayoutResult,
+    IndependentFormattingContextContents,
+};
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
+use crate::flow::CollapsibleWithParentStartMargin;
 use crate::flow::float::{FloatBox, SequentialLayoutState};
-use crate::flow::{CollapsibleWithParentStartMargin, FlowLayout};
 use crate::formatting_contexts::{
-    Baselines, IndependentFormattingContext, IndependentLayoutResult,
-    IndependentNonReplacedContents,
+    Baselines, IndependentFormattingContext, IndependentNonReplacedContents,
 };
 use crate::fragment_tree::{
     BoxFragment, CollapsedBlockMargins, CollapsedMargin, Fragment, FragmentFlags,
@@ -126,15 +127,15 @@ use crate::fragment_tree::{
 };
 use crate::geom::{LogicalRect, LogicalVec2, ToLogical};
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
-use crate::sizing::{ContentSizes, InlineContentSizesResult};
+use crate::sizing::{ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult};
 use crate::style_ext::{ComputedValuesExt, PaddingBorderMargin};
-use crate::{ConstraintSpace, ContainingBlock};
+use crate::{ConstraintSpace, ContainingBlock, PropagatedBoxTreeData};
 
 // From gfxFontConstants.h in Firefox.
 static FONT_SUBSCRIPT_OFFSET_RATIO: f32 = 0.20;
 static FONT_SUPERSCRIPT_OFFSET_RATIO: f32 = 0.34;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct InlineFormattingContext {
     /// All [`InlineItem`]s in this [`InlineFormattingContext`] stored in a flat array.
     /// [`InlineItem::StartInlineBox`] and [`InlineItem::EndInlineBox`] allow representing
@@ -171,25 +172,25 @@ pub(crate) struct InlineFormattingContext {
 }
 
 /// A collection of data used to cache [`FontMetrics`] in the [`InlineFormattingContext`]
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct FontKeyAndMetrics {
     pub key: FontInstanceKey,
     pub pt_size: Au,
     pub metrics: FontMetrics,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) enum InlineItem {
-    StartInlineBox(InlineBoxIdentifier),
+    StartInlineBox(ArcRefCell<InlineBox>),
     EndInlineBox,
-    TextRun(TextRun),
+    TextRun(ArcRefCell<TextRun>),
     OutOfFlowAbsolutelyPositionedBox(
         ArcRefCell<AbsolutelyPositionedBox>,
         usize, /* offset_in_text */
     ),
-    OutOfFlowFloatBox(FloatBox),
+    OutOfFlowFloatBox(Arc<FloatBox>),
     Atomic(
-        IndependentFormattingContext,
+        Arc<IndependentFormattingContext>,
         usize, /* offset_in_text */
         Level, /* bidi_level */
     ),
@@ -649,7 +650,7 @@ pub(super) struct InlineFormattingContextLayout<'layout_data> {
     baselines: Baselines,
 }
 
-impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
+impl InlineFormattingContextLayout<'_> {
     fn current_inline_container_state(&self) -> &InlineContainerState {
         match self.inline_box_state_stack.last() {
             Some(inline_box_state) => &inline_box_state.base,
@@ -733,7 +734,7 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
                 inline_box_state.pbm.margin.inline_start.auto_is(Au::zero);
             self.current_line_segment
                 .line_items
-                .push(LineItem::LeftInlineBoxPaddingBorderMargin(
+                .push(LineItem::InlineStartBoxPaddingBorderMargin(
                     inline_box.identifier,
                 ));
         }
@@ -778,7 +779,7 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
             self.current_line_segment.inline_size += pbm_end;
             self.current_line_segment
                 .line_items
-                .push(LineItem::RightInlineBoxPaddingBorderMargin(
+                .push(LineItem::InlineEndBoxPaddingBorderMargin(
                     inline_box_state.identifier,
                 ))
         }
@@ -905,11 +906,11 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
         let physical_line_rect = LogicalRect {
             start_corner,
             size: LogicalVec2 {
-                inline: self.containing_block.inline_size,
+                inline: self.containing_block.size.inline,
                 block: effective_block_advance.resolve(),
             },
         }
-        .to_physical(Some(self.containing_block));
+        .as_physical(Some(self.containing_block));
         self.fragments
             .push(Fragment::Positioning(PositioningFragment::new_anonymous(
                 physical_line_rect,
@@ -975,7 +976,7 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
                 placement_among_floats.start_corner.inline,
                 placement_among_floats.size.inline,
             ),
-            None => (Au::zero(), self.containing_block.inline_size),
+            None => (Au::zero(), self.containing_block.size.inline),
         };
 
         // Properly handling text-indent requires that we do not align the text
@@ -1061,7 +1062,7 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
 
         let available_inline_size = match self.current_line.placement_among_floats.get() {
             Some(placement_among_floats) => placement_among_floats.size.inline,
-            None => self.containing_block.inline_size,
+            None => self.containing_block.size.inline,
         } - line_inline_size_without_trailing_whitespace;
 
         // If this float doesn't fit on the current line or a previous float didn't fit on
@@ -1146,7 +1147,7 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
                 .size
         } else {
             LogicalVec2 {
-                inline: self.containing_block.inline_size,
+                inline: self.containing_block.size.inline,
                 block: MAX_AU,
             }
         };
@@ -1179,7 +1180,7 @@ impl<'layout_dta> InlineFormattingContextLayout<'layout_dta> {
 
         // If the potential line is larger than the containing block we do not even need to consider
         // floats. We definitely have to do a linebreak.
-        if potential_line_size.inline > self.containing_block.inline_size {
+        if potential_line_size.inline > self.containing_block.size.inline {
             return true;
         }
 
@@ -1520,7 +1521,7 @@ impl InlineFormattingContext {
     pub(super) fn new_with_builder(
         builder: InlineFormattingContextBuilder,
         layout_context: &LayoutContext,
-        text_decoration_line: TextDecorationLine,
+        propagated_data: PropagatedBoxTreeData,
         has_first_formatted_line: bool,
         is_single_line_text_input: bool,
         starting_bidi_level: Level,
@@ -1535,8 +1536,8 @@ impl InlineFormattingContext {
         let mut new_linebreaker = LineBreaker::new(text_content.as_str());
         for item in builder.inline_items.iter() {
             match &mut *item.borrow_mut() {
-                InlineItem::TextRun(ref mut text_run) => {
-                    text_run.segment_and_shape(
+                InlineItem::TextRun(text_run) => {
+                    text_run.borrow_mut().segment_and_shape(
                         &text_content,
                         &layout_context.font_context,
                         &mut new_linebreaker,
@@ -1544,8 +1545,7 @@ impl InlineFormattingContext {
                         &bidi_info,
                     );
                 },
-                InlineItem::StartInlineBox(identifier) => {
-                    let inline_box = builder.inline_boxes.get(identifier);
+                InlineItem::StartInlineBox(inline_box) => {
                     let inline_box = &mut *inline_box.borrow_mut();
                     if let Some(font) = get_font_for_first_font_for_style(
                         &inline_box.style,
@@ -1572,23 +1572,12 @@ impl InlineFormattingContext {
             inline_items: builder.inline_items,
             inline_boxes: builder.inline_boxes,
             font_metrics,
-            text_decoration_line,
+            text_decoration_line: propagated_data.text_decoration,
             has_first_formatted_line,
             contains_floats: builder.contains_floats,
             is_single_line_text_input,
             has_right_to_left_content,
         }
-    }
-
-    // This works on an already-constructed `InlineFormattingContext`,
-    // Which would have to change if/when
-    // `BlockContainer::construct` parallelize their construction.
-    pub(super) fn inline_content_sizes(
-        &self,
-        layout_context: &LayoutContext,
-        constraint_space: &ConstraintSpace,
-    ) -> InlineContentSizesResult {
-        ContentSizesComputation::compute(self, layout_context, constraint_space)
     }
 
     pub(super) fn layout(
@@ -1598,14 +1587,14 @@ impl InlineFormattingContext {
         containing_block: &ContainingBlock,
         sequential_layout_state: Option<&mut SequentialLayoutState>,
         collapsible_with_parent_start_margin: CollapsibleWithParentStartMargin,
-    ) -> FlowLayout {
+    ) -> CacheableLayoutResult {
         let first_line_inline_start = if self.has_first_formatted_line {
             containing_block
                 .style
                 .get_inherited_text()
                 .text_indent
                 .length
-                .to_used_value(containing_block.inline_size)
+                .to_used_value(containing_block.size.inline)
         } else {
             Au::zero()
         };
@@ -1676,11 +1665,11 @@ impl InlineFormattingContext {
             }
 
             match item {
-                InlineItem::StartInlineBox(identifier) => {
-                    layout.start_inline_box(&self.inline_boxes.get(identifier).borrow());
+                InlineItem::StartInlineBox(inline_box) => {
+                    layout.start_inline_box(&inline_box.borrow());
                 },
                 InlineItem::EndInlineBox => layout.finish_inline_box(),
-                InlineItem::TextRun(run) => run.layout_into_line_items(&mut layout),
+                InlineItem::TextRun(run) => run.borrow().layout_into_line_items(&mut layout),
                 InlineItem::Atomic(atomic_formatting_context, offset_in_text, bidi_level) => {
                     atomic_formatting_context.layout_into_line_items(
                         &mut layout,
@@ -1696,7 +1685,7 @@ impl InlineFormattingContext {
                         },
                     ));
                 },
-                InlineItem::OutOfFlowFloatBox(ref float_box) => {
+                InlineItem::OutOfFlowFloatBox(float_box) => {
                     float_box.layout_into_line_items(&mut layout);
                 },
             }
@@ -1710,12 +1699,14 @@ impl InlineFormattingContext {
             content_block_size == Au::zero() &&
             collapsible_with_parent_start_margin.0;
 
-        FlowLayout {
+        CacheableLayoutResult {
             fragments: layout.fragments,
             content_block_size,
             collapsible_margins_in_children,
             baselines: layout.baselines,
             depends_on_block_constraints: layout.depends_on_block_constraints,
+            content_inline_size_for_table: None,
+            specific_layout_info: None,
         }
     }
 
@@ -1935,7 +1926,7 @@ impl IndependentFormattingContext {
         // We need to know the inline size of the atomic before deciding whether to do the line break.
         let mut child_positioning_context = PositioningContext::new_for_style(self.style())
             .unwrap_or_else(|| PositioningContext::new_for_subtree(true));
-        let IndependentLayoutResult {
+        let IndependentFloatOrAtomicLayoutResult {
             mut fragment,
             baselines,
             pbm_sums,
@@ -2195,6 +2186,19 @@ fn inline_container_needs_strut(
         .unwrap_or(false)
 }
 
+impl ComputeInlineContentSizes for InlineFormattingContext {
+    // This works on an already-constructed `InlineFormattingContext`,
+    // Which would have to change if/when
+    // `BlockContainer::construct` parallelize their construction.
+    fn compute_inline_content_sizes(
+        &self,
+        layout_context: &LayoutContext,
+        constraint_space: &ConstraintSpace,
+    ) -> InlineContentSizesResult {
+        ContentSizesComputation::compute(self, layout_context, constraint_space)
+    }
+}
+
 /// A struct which takes care of computing [`ContentSizes`] for an [`InlineFormattingContext`].
 struct ContentSizesComputation<'layout_data> {
     layout_context: &'layout_data LayoutContext<'layout_data>,
@@ -2237,19 +2241,18 @@ impl<'layout_data> ContentSizesComputation<'layout_data> {
         inline_formatting_context: &InlineFormattingContext,
     ) {
         match inline_item {
-            InlineItem::StartInlineBox(identifier) => {
+            InlineItem::StartInlineBox(inline_box) => {
                 // For margins and paddings, a cyclic percentage is resolved against zero
                 // for determining intrinsic size contributions.
                 // https://drafts.csswg.org/css-sizing-3/#min-percentage-contribution
-                let inline_box = inline_formatting_context.inline_boxes.get(identifier);
-                let inline_box = (*inline_box).borrow();
+                let inline_box = inline_box.borrow();
                 let zero = Au::zero();
                 let writing_mode = self.constraint_space.writing_mode;
-                let padding = inline_box
-                    .style
+                let layout_style = inline_box.layout_style();
+                let padding = layout_style
                     .padding(writing_mode)
                     .percentages_relative_to(zero);
-                let border = inline_box.style.border_width(writing_mode);
+                let border = layout_style.border_width(writing_mode);
                 let margin = inline_box
                     .style
                     .margin(writing_mode)
@@ -2271,6 +2274,7 @@ impl<'layout_data> ContentSizesComputation<'layout_data> {
                 self.add_inline_size(length);
             },
             InlineItem::TextRun(text_run) => {
+                let text_run = &*text_run.borrow();
                 for segment in text_run.shaped_text.iter() {
                     let style_text = text_run.parent_style.get_inherited_text();
                     let can_wrap = style_text.text_wrap_mode == TextWrapMode::Wrap;

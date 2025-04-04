@@ -2,10 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use super::context::EvaluationCtx;
-use super::eval::{try_extract_nodeset, Error, Evaluatable};
-use super::parser::CoreFunction;
 use super::Value;
+use super::context::EvaluationCtx;
+use super::eval::{Error, Evaluatable, try_extract_nodeset};
+use super::parser::CoreFunction;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::inheritance::{Castable, NodeTypeId};
 use crate::dom::element::Element;
@@ -75,7 +75,7 @@ fn substring(s: &str, start_idx: isize, len: Option<isize>) -> String {
 }
 
 /// <https://www.w3.org/TR/1999/REC-xpath-19991116/#function-normalize-space>
-pub fn normalize_space(s: &str) -> String {
+pub(crate) fn normalize_space(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut last_was_whitespace = true; // Handles leading whitespace
 

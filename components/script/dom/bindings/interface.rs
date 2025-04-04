@@ -12,14 +12,15 @@ use js::error::throw_type_error;
 use js::glue::UncheckedUnwrapObject;
 use js::jsapi::JS::CompartmentIterResult;
 use js::jsapi::{
-    jsid, CallArgs, CheckedUnwrapStatic, Compartment, CompartmentSpecifier, CurrentGlobalOrNull,
+    CallArgs, CheckedUnwrapStatic, Compartment, CompartmentSpecifier, CurrentGlobalOrNull,
     GetFunctionRealm, GetNonCCWObjectGlobal, GetRealmGlobalOrNull, GetWellKnownSymbol,
-    HandleObject as RawHandleObject, IsSharableCompartment, IsSystemCompartment, JSAutoRealm,
-    JSClass, JSClassOps, JSContext, JSFunctionSpec, JSObject, JSPropertySpec, JSString, JSTracer,
+    HandleObject as RawHandleObject, IsSharableCompartment, IsSystemCompartment,
     JS_AtomizeAndPinString, JS_GetFunctionObject, JS_GetProperty, JS_IterateCompartments,
     JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewPlainObject, JS_NewStringCopyN,
-    JS_SetReservedSlot, JS_WrapObject, ObjectOps, OnNewGlobalHookOption, SymbolCode,
-    TrueHandleValue, Value, JSFUN_CONSTRUCTOR, JSPROP_PERMANENT, JSPROP_READONLY, JSPROP_RESOLVING,
+    JS_SetReservedSlot, JS_WrapObject, JSAutoRealm, JSClass, JSClassOps, JSContext,
+    JSFUN_CONSTRUCTOR, JSFunctionSpec, JSObject, JSPROP_PERMANENT, JSPROP_READONLY,
+    JSPROP_RESOLVING, JSPropertySpec, JSString, JSTracer, ObjectOps, OnNewGlobalHookOption,
+    SymbolCode, TrueHandleValue, Value, jsid,
 };
 use js::jsval::{JSVal, NullValue, PrivateValue};
 use js::rust::wrappers::{
@@ -28,40 +29,41 @@ use js::rust::wrappers::{
     JS_NewObjectWithGivenProto, RUST_SYMBOL_TO_JSID,
 };
 use js::rust::{
-    define_methods, define_properties, get_object_class, is_dom_class, maybe_wrap_object,
-    HandleObject, HandleValue, MutableHandleObject, RealmOptions,
+    HandleObject, HandleValue, MutableHandleObject, RealmOptions, define_methods,
+    define_properties, get_object_class, is_dom_class, maybe_wrap_object,
 };
+use script_bindings::constant::{ConstantSpec, define_constants};
 use servo_url::MutableOrigin;
 
+use crate::DomTypes;
 use crate::dom::bindings::codegen::InterfaceObjectMap::Globals;
 use crate::dom::bindings::codegen::PrototypeList;
-use crate::dom::bindings::constant::{define_constants, ConstantSpec};
-use crate::dom::bindings::conversions::{get_dom_class, DOM_OBJECT_SLOT};
+use crate::dom::bindings::conversions::{DOM_OBJECT_SLOT, get_dom_class};
 use crate::dom::bindings::guard::Guard;
 use crate::dom::bindings::principals::ServoJSPrincipals;
 use crate::dom::bindings::utils::{
-    get_proto_or_iface_array, DOMJSClass, ProtoOrIfaceArray, DOM_PROTOTYPE_SLOT, JSCLASS_DOM_GLOBAL,
+    DOM_PROTOTYPE_SLOT, DOMJSClass, JSCLASS_DOM_GLOBAL, ProtoOrIfaceArray, get_proto_or_iface_array,
 };
 use crate::script_runtime::JSContext as SafeJSContext;
 
 /// The class of a non-callback interface object.
 #[derive(Clone, Copy)]
-pub struct NonCallbackInterfaceObjectClass {
+pub(crate) struct NonCallbackInterfaceObjectClass {
     /// The SpiderMonkey class structure.
-    pub _class: JSClass,
+    pub(crate) _class: JSClass,
     /// The prototype id of that interface, used in the hasInstance hook.
-    pub _proto_id: PrototypeList::ID,
+    pub(crate) _proto_id: PrototypeList::ID,
     /// The prototype depth of that interface, used in the hasInstance hook.
-    pub _proto_depth: u16,
+    pub(crate) _proto_depth: u16,
     /// The string representation of the object.
-    pub representation: &'static [u8],
+    pub(crate) representation: &'static [u8],
 }
 
 unsafe impl Sync for NonCallbackInterfaceObjectClass {}
 
 impl NonCallbackInterfaceObjectClass {
     /// Create a new `NonCallbackInterfaceObjectClass` structure.
-    pub const fn new(
+    pub(crate) const fn new(
         constructor_behavior: &'static InterfaceConstructorBehavior,
         string_rep: &'static [u8],
         proto_id: PrototypeList::ID,
@@ -83,21 +85,21 @@ impl NonCallbackInterfaceObjectClass {
     }
 
     /// cast own reference to `JSClass` reference
-    pub fn as_jsclass(&self) -> &JSClass {
+    pub(crate) fn as_jsclass(&self) -> &JSClass {
         unsafe { &*(self as *const _ as *const JSClass) }
     }
 }
 
 /// A constructor class hook.
-pub type ConstructorClassHook =
+pub(crate) type ConstructorClassHook =
     unsafe extern "C" fn(cx: *mut JSContext, argc: u32, vp: *mut Value) -> bool;
 
 /// The constructor behavior of a non-callback interface object.
-pub struct InterfaceConstructorBehavior(JSClassOps);
+pub(crate) struct InterfaceConstructorBehavior(JSClassOps);
 
 impl InterfaceConstructorBehavior {
     /// An interface constructor that unconditionally throws a type error.
-    pub const fn throw() -> Self {
+    pub(crate) const fn throw() -> Self {
         InterfaceConstructorBehavior(JSClassOps {
             addProperty: None,
             delProperty: None,
@@ -113,7 +115,7 @@ impl InterfaceConstructorBehavior {
     }
 
     /// An interface constructor that calls a native Rust function.
-    pub const fn call(hook: ConstructorClassHook) -> Self {
+    pub(crate) const fn call(hook: ConstructorClassHook) -> Self {
         InterfaceConstructorBehavior(JSClassOps {
             addProperty: None,
             delProperty: None,
@@ -130,10 +132,10 @@ impl InterfaceConstructorBehavior {
 }
 
 /// A trace hook.
-pub type TraceHook = unsafe extern "C" fn(trc: *mut JSTracer, obj: *mut JSObject);
+pub(crate) type TraceHook = unsafe extern "C" fn(trc: *mut JSTracer, obj: *mut JSObject);
 
 /// Create a global object with the given class.
-pub unsafe fn create_global_object(
+pub(crate) unsafe fn create_global_object<D: DomTypes>(
     cx: SafeJSContext,
     class: &'static JSClass,
     private: *const libc::c_void,
@@ -146,10 +148,9 @@ pub unsafe fn create_global_object(
     let mut options = RealmOptions::default();
     options.creationOptions_.traceGlobal_ = Some(trace);
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
-    options.creationOptions_.streams_ = true;
     select_compartment(cx, &mut options);
 
-    let principal = ServoJSPrincipals::new(origin);
+    let principal = ServoJSPrincipals::new::<D>(origin);
 
     rval.set(JS_NewGlobalObject(
         *cx,
@@ -211,7 +212,7 @@ fn select_compartment(cx: SafeJSContext, options: &mut RealmOptions) {
 }
 
 /// Create and define the interface object of a callback interface.
-pub fn create_callback_interface_object(
+pub(crate) fn create_callback_interface_object<D: DomTypes>(
     cx: SafeJSContext,
     global: HandleObject,
     constants: &[Guard<&[ConstantSpec]>],
@@ -223,14 +224,14 @@ pub fn create_callback_interface_object(
         rval.set(JS_NewObject(*cx, ptr::null()));
     }
     assert!(!rval.is_null());
-    define_guarded_constants(cx, rval.handle(), constants, global);
+    define_guarded_constants::<D>(cx, rval.handle(), constants, global);
     define_name(cx, rval.handle(), name);
     define_on_global_object(cx, global, name, rval.handle());
 }
 
 /// Create the interface prototype object of a non-callback interface.
 #[allow(clippy::too_many_arguments)]
-pub fn create_interface_prototype_object(
+pub(crate) fn create_interface_prototype_object<D: DomTypes>(
     cx: SafeJSContext,
     global: HandleObject,
     proto: HandleObject,
@@ -239,9 +240,9 @@ pub fn create_interface_prototype_object(
     regular_properties: &[Guard<&'static [JSPropertySpec]>],
     constants: &[Guard<&[ConstantSpec]>],
     unscopable_names: &[&CStr],
-    rval: MutableHandleObject,
+    mut rval: MutableHandleObject,
 ) {
-    create_object(
+    create_object::<D>(
         cx,
         global,
         proto,
@@ -249,7 +250,7 @@ pub fn create_interface_prototype_object(
         regular_methods,
         regular_properties,
         constants,
-        rval,
+        rval.reborrow(),
     );
 
     if !unscopable_names.is_empty() {
@@ -275,7 +276,7 @@ pub fn create_interface_prototype_object(
 
 /// Create and define the interface object of a non-callback interface.
 #[allow(clippy::too_many_arguments)]
-pub fn create_noncallback_interface_object(
+pub(crate) fn create_noncallback_interface_object<D: DomTypes>(
     cx: SafeJSContext,
     global: HandleObject,
     proto: HandleObject,
@@ -287,9 +288,9 @@ pub fn create_noncallback_interface_object(
     name: &CStr,
     length: u32,
     legacy_window_alias_names: &[&CStr],
-    rval: MutableHandleObject,
+    mut rval: MutableHandleObject,
 ) {
-    create_object(
+    create_object::<D>(
         cx,
         global,
         proto,
@@ -297,7 +298,7 @@ pub fn create_noncallback_interface_object(
         static_methods,
         static_properties,
         constants,
-        rval,
+        rval.reborrow(),
     );
     unsafe {
         assert!(JS_LinkConstructorAndPrototype(
@@ -318,7 +319,7 @@ pub fn create_noncallback_interface_object(
 }
 
 /// Create and define the named constructors of a non-callback interface.
-pub fn create_named_constructors(
+pub(crate) fn create_named_constructors(
     cx: SafeJSContext,
     global: HandleObject,
     named_constructors: &[(ConstructorClassHook, &CStr, u32)],
@@ -348,7 +349,7 @@ pub fn create_named_constructors(
 
 /// Create a new object with a unique type.
 #[allow(clippy::too_many_arguments)]
-pub fn create_object(
+pub(crate) fn create_object<D: DomTypes>(
     cx: SafeJSContext,
     global: HandleObject,
     proto: HandleObject,
@@ -362,34 +363,34 @@ pub fn create_object(
         rval.set(JS_NewObjectWithGivenProto(*cx, class, proto));
     }
     assert!(!rval.is_null());
-    define_guarded_methods(cx, rval.handle(), methods, global);
-    define_guarded_properties(cx, rval.handle(), properties, global);
-    define_guarded_constants(cx, rval.handle(), constants, global);
+    define_guarded_methods::<D>(cx, rval.handle(), methods, global);
+    define_guarded_properties::<D>(cx, rval.handle(), properties, global);
+    define_guarded_constants::<D>(cx, rval.handle(), constants, global);
 }
 
 /// Conditionally define constants on an object.
-pub fn define_guarded_constants(
+pub(crate) fn define_guarded_constants<D: DomTypes>(
     cx: SafeJSContext,
     obj: HandleObject,
     constants: &[Guard<&[ConstantSpec]>],
     global: HandleObject,
 ) {
     for guard in constants {
-        if let Some(specs) = guard.expose(cx, obj, global) {
+        if let Some(specs) = guard.expose::<D>(cx, obj, global) {
             define_constants(cx, obj, specs);
         }
     }
 }
 
 /// Conditionally define methods on an object.
-pub fn define_guarded_methods(
+pub(crate) fn define_guarded_methods<D: DomTypes>(
     cx: SafeJSContext,
     obj: HandleObject,
     methods: &[Guard<&'static [JSFunctionSpec]>],
     global: HandleObject,
 ) {
     for guard in methods {
-        if let Some(specs) = guard.expose(cx, obj, global) {
+        if let Some(specs) = guard.expose::<D>(cx, obj, global) {
             unsafe {
                 define_methods(*cx, obj, specs).unwrap();
             }
@@ -398,14 +399,14 @@ pub fn define_guarded_methods(
 }
 
 /// Conditionally define properties on an object.
-pub fn define_guarded_properties(
+pub(crate) fn define_guarded_properties<D: DomTypes>(
     cx: SafeJSContext,
     obj: HandleObject,
     properties: &[Guard<&'static [JSPropertySpec]>],
     global: HandleObject,
 ) {
     for guard in properties {
-        if let Some(specs) = guard.expose(cx, obj, global) {
+        if let Some(specs) = guard.expose::<D>(cx, obj, global) {
             unsafe {
                 define_properties(*cx, obj, specs).unwrap();
             }
@@ -415,7 +416,7 @@ pub fn define_guarded_properties(
 
 /// Returns whether an interface with exposure set given by `globals` should
 /// be exposed in the global object `obj`.
-pub fn is_exposed_in(object: HandleObject, globals: Globals) -> bool {
+pub(crate) fn is_exposed_in(object: HandleObject, globals: Globals) -> bool {
     unsafe {
         let unwrapped = UncheckedUnwrapObject(object.get(), /* stopAtWindowProxy = */ false);
         let dom_class = get_dom_class(unwrapped).unwrap();
@@ -425,7 +426,7 @@ pub fn is_exposed_in(object: HandleObject, globals: Globals) -> bool {
 
 /// Define a property with a given name on the global object. Should be called
 /// through the resolve hook.
-pub fn define_on_global_object(
+pub(crate) fn define_on_global_object(
     cx: SafeJSContext,
     global: HandleObject,
     name: &CStr,
@@ -530,7 +531,7 @@ unsafe extern "C" fn non_new_constructor(
     false
 }
 
-pub enum ProtoOrIfaceIndex {
+pub(crate) enum ProtoOrIfaceIndex {
     ID(PrototypeList::ID),
     Constructor(PrototypeList::Constructor),
 }
@@ -544,7 +545,7 @@ impl From<ProtoOrIfaceIndex> for usize {
     }
 }
 
-pub fn get_per_interface_object_handle(
+pub(crate) fn get_per_interface_object_handle(
     cx: SafeJSContext,
     global: HandleObject,
     id: ProtoOrIfaceIndex,
@@ -568,7 +569,7 @@ pub fn get_per_interface_object_handle(
     }
 }
 
-pub fn define_dom_interface(
+pub(crate) fn define_dom_interface(
     cx: SafeJSContext,
     global: HandleObject,
     id: ProtoOrIfaceIndex,
@@ -598,7 +599,7 @@ fn get_proto_id_for_new_target(new_target: HandleObject) -> Option<PrototypeList
     }
 }
 
-pub fn get_desired_proto(
+pub(crate) fn get_desired_proto(
     cx: SafeJSContext,
     args: &CallArgs,
     proto_id: PrototypeList::ID,
@@ -629,7 +630,7 @@ pub fn get_desired_proto(
             // We might still have a cross-compartment wrapper for a known DOM
             // constructor.  CheckedUnwrapStatic is fine here, because we're looking for
             // DOM constructors and those can't be cross-origin objects.
-            *new_target = CheckedUnwrapStatic(*new_target);
+            new_target.set(CheckedUnwrapStatic(*new_target));
             if !new_target.is_null() && *new_target != *original_new_target {
                 get_proto_id_for_new_target(new_target.handle())
             } else {
@@ -682,7 +683,7 @@ pub fn get_desired_proto(
                 global.handle(),
                 ProtoOrIfaceIndex::ID(proto_id),
                 creator,
-                desired_proto,
+                desired_proto.reborrow(),
             );
             if desired_proto.is_null() {
                 return Err(());

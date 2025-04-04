@@ -5,22 +5,26 @@
 use std::cmp;
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::ptr::NonNull;
 
 use base::id::{BrowsingContextId, PipelineId};
 use cookie::Cookie;
+use embedder_traits::{
+    WebDriverCookieError, WebDriverFrameId, WebDriverJSError, WebDriverJSResult, WebDriverJSValue,
+};
 use euclid::default::{Point2D, Rect, Size2D};
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcSender};
-use js::jsapi::{HandleValueArray, JSAutoRealm, JSContext, JSType, JS_IsExceptionPending};
+use js::jsapi::{
+    self, GetPropertyKeys, HandleValueArray, JS_GetOwnPropertyDescriptorById, JS_GetPropertyById,
+    JS_IsExceptionPending, JSAutoRealm, JSContext, JSType, PropertyDescriptor,
+};
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::{JS_CallFunctionName, JS_GetProperty, JS_HasOwnProperty, JS_TypeOfValue};
-use js::rust::{HandleObject, HandleValue};
-use net_traits::CookieSource::{NonHTTP, HTTP};
+use js::rust::{HandleObject, HandleValue, IdVector, ToString};
+use net_traits::CookieSource::{HTTP, NonHTTP};
 use net_traits::CoreResourceMsg::{DeleteCookies, GetCookiesDataForUrl, SetCookieForUrl};
 use net_traits::IpcSend;
-use script_traits::webdriver_msg::{
-    WebDriverCookieError, WebDriverFrameId, WebDriverJSError, WebDriverJSResult, WebDriverJSValue,
-};
 use servo_url::ServoUrl;
 use webdriver::common::{WebElement, WebFrame, WebWindow};
 use webdriver::error::ErrorStatus;
@@ -38,12 +42,13 @@ use crate::dom::bindings::codegen::Bindings::NodeBinding::{GetRootNodeOptions, N
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::XMLSerializerBinding::XMLSerializerMethods;
 use crate::dom::bindings::conversions::{
-    get_property, get_property_jsval, is_array_like, root_from_object, ConversionBehavior,
-    ConversionResult, FromJSValConvertible, StringificationBehavior,
+    ConversionBehavior, ConversionResult, FromJSValConvertible, StringificationBehavior,
+    get_property, get_property_jsval, is_array_like, jsid_to_string, jsstring_to_str,
+    root_from_object,
 };
-use crate::dom::bindings::error::{throw_dom_exception, Error};
+use crate::dom::bindings::error::{Error, throw_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::{DomGlobal, DomObject};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::Element;
@@ -55,7 +60,7 @@ use crate::dom::htmliframeelement::HTMLIFrameElement;
 use crate::dom::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::htmloptionelement::HTMLOptionElement;
 use crate::dom::htmlselectelement::HTMLSelectElement;
-use crate::dom::node::{window_from_node, Node, ShadowIncluding};
+use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::nodelist::NodeList;
 use crate::dom::window::Window;
 use crate::dom::xmlserializer::XMLSerializer;
@@ -142,13 +147,23 @@ unsafe fn object_has_to_json_property(
         rooted!(in(cx) let mut value = UndefinedValue());
         let result = JS_GetProperty(cx, object, name.as_ptr(), value.handle_mut());
         if !result {
-            throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+            throw_dom_exception(
+                SafeJSContext::from_ptr(cx),
+                global_scope,
+                Error::JSFailed,
+                CanGc::note(),
+            );
             false
         } else {
             result && JS_TypeOfValue(cx, value.handle()) == JSType::JSTYPE_FUNCTION
         }
     } else if JS_IsExceptionPending(cx) {
-        throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+        throw_dom_exception(
+            SafeJSContext::from_ptr(cx),
+            global_scope,
+            Error::JSFailed,
+            CanGc::note(),
+        );
         false
     } else {
         false
@@ -156,7 +171,17 @@ unsafe fn object_has_to_json_property(
 }
 
 #[allow(unsafe_code)]
-pub unsafe fn jsval_to_webdriver(
+/// <https://w3c.github.io/webdriver/#dfn-collection>
+unsafe fn is_arguments_object(cx: *mut JSContext, value: HandleValue) -> bool {
+    rooted!(in(cx) let class_name = ToString(cx, value));
+    let Some(class_name) = NonNull::new(class_name.get()) else {
+        return false;
+    };
+    jsstring_to_str(cx, class_name) == "[object Arguments]"
+}
+
+#[allow(unsafe_code)]
+pub(crate) unsafe fn jsval_to_webdriver(
     cx: *mut JSContext,
     global_scope: &GlobalScope,
     val: HandleValue,
@@ -168,7 +193,14 @@ pub unsafe fn jsval_to_webdriver(
         Ok(WebDriverJSValue::Null)
     } else if val.get().is_boolean() {
         Ok(WebDriverJSValue::Boolean(val.get().to_boolean()))
-    } else if val.get().is_double() || val.get().is_int32() {
+    } else if val.get().is_int32() {
+        Ok(WebDriverJSValue::Int(
+            match FromJSValConvertible::from_jsval(cx, val, ConversionBehavior::Default).unwrap() {
+                ConversionResult::Success(c) => c,
+                _ => unreachable!(),
+            },
+        ))
+    } else if val.get().is_double() {
         Ok(WebDriverJSValue::Number(
             match FromJSValConvertible::from_jsval(cx, val, ()).unwrap() {
                 ConversionResult::Success(c) => c,
@@ -192,7 +224,7 @@ pub unsafe fn jsval_to_webdriver(
         });
         let _ac = JSAutoRealm::new(cx, *object);
 
-        if is_array_like(cx, val) {
+        if is_array_like::<crate::DomTypeHolder>(cx, val) || is_arguments_object(cx, val) {
             let mut result: Vec<WebDriverJSValue> = Vec::new();
 
             let length = match get_property::<u32>(
@@ -206,7 +238,12 @@ pub unsafe fn jsval_to_webdriver(
                     _ => return Err(WebDriverJSError::UnknownType),
                 },
                 Err(error) => {
-                    throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, error);
+                    throw_dom_exception(
+                        SafeJSContext::from_ptr(cx),
+                        global_scope,
+                        error,
+                        CanGc::note(),
+                    );
                     return Err(WebDriverJSError::JSError);
                 },
             };
@@ -219,7 +256,12 @@ pub unsafe fn jsval_to_webdriver(
                         err @ Err(_) => return err,
                     },
                     Err(error) => {
-                        throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, error);
+                        throw_dom_exception(
+                            SafeJSContext::from_ptr(cx),
+                            global_scope,
+                            error,
+                            CanGc::note(),
+                        );
                         return Err(WebDriverJSError::JSError);
                     },
                 }
@@ -234,9 +276,7 @@ pub unsafe fn jsval_to_webdriver(
             let window_proxy = window.window_proxy();
             if window_proxy.is_browsing_context_discarded() {
                 Err(WebDriverJSError::StaleElementReference)
-            } else if window_proxy.browsing_context_id() ==
-                window_proxy.top_level_browsing_context_id()
-            {
+            } else if window_proxy.browsing_context_id() == window_proxy.webview_id() {
                 Ok(WebDriverJSValue::Window(WebWindow(
                     window.Document().upcast::<Node>().unique_id(),
                 )))
@@ -252,29 +292,65 @@ pub unsafe fn jsval_to_webdriver(
                 cx,
                 object.handle(),
                 name.as_ptr(),
-                &HandleValueArray::new(),
+                &HandleValueArray::empty(),
                 value.handle_mut(),
             ) {
                 jsval_to_webdriver(cx, global_scope, value.handle())
             } else {
-                throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+                throw_dom_exception(
+                    SafeJSContext::from_ptr(cx),
+                    global_scope,
+                    Error::JSFailed,
+                    CanGc::note(),
+                );
                 Err(WebDriverJSError::JSError)
             }
         } else {
             let mut result = HashMap::new();
 
-            let common_properties = ["x", "y", "width", "height", "key"];
-            for property in common_properties.iter() {
-                rooted!(in(cx) let mut item = UndefinedValue());
-                if get_property_jsval(cx, object.handle(), property, item.handle_mut()).is_ok() {
-                    if !item.is_undefined() {
-                        if let Ok(value) = jsval_to_webdriver(cx, global_scope, item.handle()) {
-                            result.insert(property.to_string(), value);
-                        }
-                    }
-                } else {
-                    throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+            let mut ids = IdVector::new(cx);
+            if !GetPropertyKeys(
+                cx,
+                object.handle().into(),
+                jsapi::JSITER_OWNONLY,
+                ids.handle_mut(),
+            ) {
+                return Err(WebDriverJSError::JSError);
+            }
+            for id in ids.iter() {
+                rooted!(in(cx) let id = *id);
+                rooted!(in(cx) let mut desc = PropertyDescriptor::default());
+
+                let mut is_none = false;
+                if !JS_GetOwnPropertyDescriptorById(
+                    cx,
+                    object.handle().into(),
+                    id.handle().into(),
+                    desc.handle_mut().into(),
+                    &mut is_none,
+                ) {
                     return Err(WebDriverJSError::JSError);
+                }
+
+                rooted!(in(cx) let mut property = UndefinedValue());
+                if !JS_GetPropertyById(
+                    cx,
+                    object.handle().into(),
+                    id.handle().into(),
+                    property.handle_mut().into(),
+                ) {
+                    return Err(WebDriverJSError::JSError);
+                }
+                if !property.is_undefined() {
+                    let Some(name) = jsid_to_string(cx, id.handle()) else {
+                        return Err(WebDriverJSError::JSError);
+                    };
+
+                    if let Ok(value) = jsval_to_webdriver(cx, global_scope, property.handle()) {
+                        result.insert(name.into(), value);
+                    } else {
+                        return Err(WebDriverJSError::JSError);
+                    }
                 }
             }
 
@@ -286,7 +362,7 @@ pub unsafe fn jsval_to_webdriver(
 }
 
 #[allow(unsafe_code)]
-pub fn handle_execute_script(
+pub(crate) fn handle_execute_script(
     window: Option<DomRoot<Window>>,
     eval: String,
     reply: IpcSender<WebDriverJSResult>,
@@ -297,7 +373,7 @@ pub fn handle_execute_script(
             let result = unsafe {
                 let cx = window.get_cx();
                 rooted!(in(*cx) let mut rval = UndefinedValue());
-                let global = window.upcast::<GlobalScope>();
+                let global = window.as_global_scope();
                 global.evaluate_js_on_global_with_result(
                     &eval,
                     rval.handle_mut(),
@@ -305,7 +381,7 @@ pub fn handle_execute_script(
                     global.api_base_url(),
                     can_gc,
                 );
-                jsval_to_webdriver(*cx, window.upcast::<GlobalScope>(), rval.handle())
+                jsval_to_webdriver(*cx, global, rval.handle())
             };
 
             reply.send(result).unwrap();
@@ -318,7 +394,7 @@ pub fn handle_execute_script(
     }
 }
 
-pub fn handle_execute_async_script(
+pub(crate) fn handle_execute_async_script(
     window: Option<DomRoot<Window>>,
     eval: String,
     reply: IpcSender<WebDriverJSResult>,
@@ -329,12 +405,13 @@ pub fn handle_execute_async_script(
             let cx = window.get_cx();
             window.set_webdriver_script_chan(Some(reply));
             rooted!(in(*cx) let mut rval = UndefinedValue());
-            let global = window.upcast::<GlobalScope>();
-            global.evaluate_js_on_global_with_result(
+
+            let global_scope = window.as_global_scope();
+            global_scope.evaluate_js_on_global_with_result(
                 &eval,
                 rval.handle_mut(),
-                ScriptFetchOptions::default_classic_script(global),
-                global.api_base_url(),
+                ScriptFetchOptions::default_classic_script(global_scope),
+                global_scope.api_base_url(),
                 can_gc,
             );
         },
@@ -346,7 +423,7 @@ pub fn handle_execute_async_script(
     }
 }
 
-pub fn handle_get_browsing_context_id(
+pub(crate) fn handle_get_browsing_context_id(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     webdriver_frame_id: WebDriverFrameId,
@@ -380,8 +457,8 @@ pub fn handle_get_browsing_context_id(
 
 // https://w3c.github.io/webdriver/#dfn-center-point
 fn get_element_in_view_center_point(element: &Element, can_gc: CanGc) -> Option<Point2D<i64>> {
-    window_from_node(element.upcast::<Node>())
-        .Document()
+    element
+        .owner_document()
         .GetBody()
         .map(DomRoot::upcast::<Element>)
         .and_then(|body| {
@@ -412,7 +489,7 @@ fn get_element_in_view_center_point(element: &Element, can_gc: CanGc) -> Option<
         })
 }
 
-pub fn handle_get_element_in_view_center_point(
+pub(crate) fn handle_get_element_in_view_center_point(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -429,7 +506,7 @@ pub fn handle_get_element_in_view_center_point(
         .unwrap();
 }
 
-pub fn handle_find_element_css(
+pub(crate) fn handle_find_element_css(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
@@ -450,7 +527,7 @@ pub fn handle_find_element_css(
         .unwrap();
 }
 
-pub fn handle_find_element_link_text(
+pub(crate) fn handle_find_element_link_text(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
@@ -469,11 +546,12 @@ pub fn handle_find_element_link_text(
         .unwrap();
 }
 
-pub fn handle_find_element_tag_name(
+pub(crate) fn handle_find_element_tag_name(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: IpcSender<Result<Option<String>, ErrorStatus>>,
+    _can_gc: CanGc,
 ) {
     reply
         .send(
@@ -491,7 +569,7 @@ pub fn handle_find_element_tag_name(
         .unwrap();
 }
 
-pub fn handle_find_elements_css(
+pub(crate) fn handle_find_elements_css(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
@@ -517,7 +595,7 @@ pub fn handle_find_elements_css(
         .unwrap();
 }
 
-pub fn handle_find_elements_link_text(
+pub(crate) fn handle_find_elements_link_text(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
@@ -536,11 +614,12 @@ pub fn handle_find_elements_link_text(
         .unwrap();
 }
 
-pub fn handle_find_elements_tag_name(
+pub(crate) fn handle_find_elements_tag_name(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: IpcSender<Result<Vec<String>, ErrorStatus>>,
+    _can_gc: CanGc,
 ) {
     reply
         .send(
@@ -558,7 +637,7 @@ pub fn handle_find_elements_tag_name(
         .unwrap();
 }
 
-pub fn handle_find_element_element_css(
+pub(crate) fn handle_find_element_element_css(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -576,7 +655,7 @@ pub fn handle_find_element_element_css(
         .unwrap();
 }
 
-pub fn handle_find_element_element_link_text(
+pub(crate) fn handle_find_element_element_link_text(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -592,12 +671,13 @@ pub fn handle_find_element_element_link_text(
         .unwrap();
 }
 
-pub fn handle_find_element_element_tag_name(
+pub(crate) fn handle_find_element_element_tag_name(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
     reply: IpcSender<Result<Option<String>, ErrorStatus>>,
+    _can_gc: CanGc,
 ) {
     reply
         .send(
@@ -615,7 +695,7 @@ pub fn handle_find_element_element_tag_name(
         .unwrap();
 }
 
-pub fn handle_find_element_elements_css(
+pub(crate) fn handle_find_element_elements_css(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -638,7 +718,7 @@ pub fn handle_find_element_elements_css(
         .unwrap();
 }
 
-pub fn handle_find_element_elements_link_text(
+pub(crate) fn handle_find_element_elements_link_text(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -654,12 +734,13 @@ pub fn handle_find_element_elements_link_text(
         .unwrap();
 }
 
-pub fn handle_find_element_elements_tag_name(
+pub(crate) fn handle_find_element_elements_tag_name(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
     reply: IpcSender<Result<Vec<String>, ErrorStatus>>,
+    _can_gc: CanGc,
 ) {
     reply
         .send(
@@ -677,7 +758,7 @@ pub fn handle_find_element_elements_tag_name(
         .unwrap();
 }
 
-pub fn handle_focus_element(
+pub(crate) fn handle_focus_element(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -700,7 +781,7 @@ pub fn handle_focus_element(
         .unwrap();
 }
 
-pub fn handle_get_active_element(
+pub(crate) fn handle_get_active_element(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Option<String>>,
@@ -715,7 +796,7 @@ pub fn handle_get_active_element(
         .unwrap();
 }
 
-pub fn handle_get_page_source(
+pub(crate) fn handle_get_page_source(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Result<String, ErrorStatus>>,
@@ -727,7 +808,7 @@ pub fn handle_get_page_source(
                 .find_document(pipeline)
                 .ok_or(ErrorStatus::UnknownError)
                 .and_then(|document| match document.GetDocumentElement() {
-                    Some(element) => match element.GetOuterHTML() {
+                    Some(element) => match element.GetOuterHTML(can_gc) {
                         Ok(source) => Ok(source.to_string()),
                         Err(_) => {
                             match XMLSerializer::new(document.window(), None, can_gc)
@@ -744,7 +825,7 @@ pub fn handle_get_page_source(
         .unwrap();
 }
 
-pub fn handle_get_cookies(
+pub(crate) fn handle_get_cookies(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Vec<Serde<Cookie<'static>>>>,
@@ -758,7 +839,7 @@ pub fn handle_get_cookies(
                     let (sender, receiver) = ipc::channel().unwrap();
                     let _ = document
                         .window()
-                        .upcast::<GlobalScope>()
+                        .as_global_scope()
                         .resource_threads()
                         .send(GetCookiesDataForUrl(url, sender, NonHTTP));
                     receiver.recv().unwrap()
@@ -770,7 +851,7 @@ pub fn handle_get_cookies(
 }
 
 // https://w3c.github.io/webdriver/webdriver-spec.html#get-cookie
-pub fn handle_get_cookie(
+pub(crate) fn handle_get_cookie(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     name: String,
@@ -785,7 +866,7 @@ pub fn handle_get_cookie(
                     let (sender, receiver) = ipc::channel().unwrap();
                     let _ = document
                         .window()
-                        .upcast::<GlobalScope>()
+                        .as_global_scope()
                         .resource_threads()
                         .send(GetCookiesDataForUrl(url, sender, NonHTTP));
                     let cookies = receiver.recv().unwrap();
@@ -801,7 +882,7 @@ pub fn handle_get_cookie(
 }
 
 // https://w3c.github.io/webdriver/webdriver-spec.html#add-cookie
-pub fn handle_add_cookie(
+pub(crate) fn handle_add_cookie(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     cookie: Cookie<'static>,
@@ -830,7 +911,7 @@ pub fn handle_add_cookie(
             (false, Some(ref domain)) if url.host_str().map(|x| x == domain).unwrap_or(false) => {
                 let _ = document
                     .window()
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .resource_threads()
                     .send(SetCookieForUrl(url, Serde(cookie), method));
                 Ok(())
@@ -838,7 +919,7 @@ pub fn handle_add_cookie(
             (false, None) => {
                 let _ = document
                     .window()
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .resource_threads()
                     .send(SetCookieForUrl(url, Serde(cookie), method));
                 Ok(())
@@ -848,7 +929,7 @@ pub fn handle_add_cookie(
         .unwrap();
 }
 
-pub fn handle_delete_cookies(
+pub(crate) fn handle_delete_cookies(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Result<(), ErrorStatus>>,
@@ -862,14 +943,14 @@ pub fn handle_delete_cookies(
     let url = document.url();
     document
         .window()
-        .upcast::<GlobalScope>()
+        .as_global_scope()
         .resource_threads()
         .send(DeleteCookies(url))
         .unwrap();
     reply.send(Ok(())).unwrap();
 }
 
-pub fn handle_get_title(
+pub(crate) fn handle_get_title(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<String>,
@@ -885,7 +966,7 @@ pub fn handle_get_title(
         .unwrap();
 }
 
-pub fn handle_get_rect(
+pub(crate) fn handle_get_rect(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -931,7 +1012,7 @@ pub fn handle_get_rect(
         .unwrap();
 }
 
-pub fn handle_get_bounding_client_rect(
+pub(crate) fn handle_get_bounding_client_rect(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -956,7 +1037,7 @@ pub fn handle_get_bounding_client_rect(
         .unwrap();
 }
 
-pub fn handle_get_text(
+pub(crate) fn handle_get_text(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
@@ -970,7 +1051,7 @@ pub fn handle_get_text(
         .unwrap();
 }
 
-pub fn handle_get_name(
+pub(crate) fn handle_get_name(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
@@ -984,7 +1065,7 @@ pub fn handle_get_name(
         .unwrap();
 }
 
-pub fn handle_get_attribute(
+pub(crate) fn handle_get_attribute(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
@@ -1004,7 +1085,7 @@ pub fn handle_get_attribute(
 }
 
 #[allow(unsafe_code)]
-pub fn handle_get_property(
+pub(crate) fn handle_get_property(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
@@ -1027,14 +1108,15 @@ pub fn handle_get_property(
                         property.handle_mut(),
                     )
                 } {
-                    Ok(_) => match unsafe {
-                        jsval_to_webdriver(*cx, &node.reflector().global(), property.handle())
-                    } {
-                        Ok(property) => property,
-                        Err(_) => WebDriverJSValue::Undefined,
+                    Ok(_) => {
+                        match unsafe { jsval_to_webdriver(*cx, &node.global(), property.handle()) }
+                        {
+                            Ok(property) => property,
+                            Err(_) => WebDriverJSValue::Undefined,
+                        }
                     },
                     Err(error) => {
-                        throw_dom_exception(cx, &node.reflector().global(), error);
+                        throw_dom_exception(cx, &node.global(), error, CanGc::note());
                         WebDriverJSValue::Undefined
                     },
                 }
@@ -1043,7 +1125,7 @@ pub fn handle_get_property(
         .unwrap();
 }
 
-pub fn handle_get_css(
+pub(crate) fn handle_get_css(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
@@ -1054,7 +1136,7 @@ pub fn handle_get_css(
     reply
         .send(
             find_node_by_unique_id(documents, pipeline, node_id).map(|node| {
-                let window = window_from_node(&*node);
+                let window = node.owner_window();
                 let element = node.downcast::<Element>().unwrap();
                 String::from(
                     window
@@ -1066,10 +1148,11 @@ pub fn handle_get_css(
         .unwrap();
 }
 
-pub fn handle_get_url(
+pub(crate) fn handle_get_url(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<ServoUrl>,
+    _can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1083,7 +1166,7 @@ pub fn handle_get_url(
 }
 
 // https://w3c.github.io/webdriver/#element-click
-pub fn handle_element_click(
+pub(crate) fn handle_element_click(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -1180,7 +1263,7 @@ pub fn handle_element_click(
         .unwrap();
 }
 
-pub fn handle_is_enabled(
+pub(crate) fn handle_is_enabled(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
@@ -1198,7 +1281,7 @@ pub fn handle_is_enabled(
         .unwrap();
 }
 
-pub fn handle_is_selected(
+pub(crate) fn handle_is_selected(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,

@@ -4,36 +4,39 @@
 
 use std::cell::LazyCell;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use app_units::Au;
 use base::id::{BrowsingContextId, PipelineId};
-use canvas_traits::canvas::{CanvasId, CanvasMsg, FromLayoutMsg};
 use data_url::DataUrl;
-use ipc_channel::ipc::{self, IpcSender};
+use euclid::Size2D;
 use net_traits::image_cache::{ImageOrMetadataAvailable, UsePlaceholder};
 use pixels::Image;
-use serde::Serialize;
+use script_layout_interface::IFrameSize;
 use servo_arc::Arc as ServoArc;
+use style::Zero;
 use style::computed_values::object_fit::T as ObjectFit;
 use style::logical_geometry::{Direction, WritingMode};
 use style::properties::ComputedValues;
 use style::servo::url::ComputedUrl;
-use style::values::computed::image::Image as ComputedImage;
 use style::values::CSSFloat;
-use style::Zero;
+use style::values::computed::image::Image as ComputedImage;
 use url::Url;
 use webrender_api::ImageKey;
 
+use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::NodeExt;
 use crate::fragment_tree::{BaseFragmentInfo, Fragment, IFrameFragment, ImageFragment};
-use crate::geom::{LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSize, Size};
-use crate::sizing::{ContentSizes, InlineContentSizesResult};
-use crate::style_ext::{AspectRatio, Clamp, ComputedValuesExt, ContentBoxSizesAndPBM};
+use crate::geom::{
+    LogicalSides1D, LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSize, Size, Sizes,
+};
+use crate::layout_box_base::LayoutBoxBase;
+use crate::sizing::{ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult};
+use crate::style_ext::{AspectRatio, Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, LayoutStyle};
 use crate::{ConstraintSpace, ContainingBlock, SizeConstraint};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct ReplacedContents {
     pub kind: ReplacedContentKind,
     natural_size: NaturalSizes,
@@ -57,7 +60,7 @@ pub(crate) struct ReplacedContents {
 ///
 /// * IFrames do not have natural width and height or natural ratio according
 ///   to <https://drafts.csswg.org/css-images/#intrinsic-dimensions>.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct NaturalSizes {
     pub width: Option<Au>,
     pub height: Option<Au>,
@@ -91,10 +94,9 @@ impl NaturalSizes {
     }
 }
 
-#[derive(Serialize)]
 pub(crate) enum CanvasSource {
     WebGL(ImageKey),
-    Image(Arc<Mutex<IpcSender<CanvasMsg>>>),
+    Image(ImageKey),
     WebGPU(ImageKey),
     /// transparent black
     Empty,
@@ -115,24 +117,23 @@ impl fmt::Debug for CanvasSource {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct CanvasInfo {
     pub source: CanvasSource,
-    pub canvas_id: CanvasId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct IFrameInfo {
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct VideoInfo {
     pub image_key: webrender_api::ImageKey,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) enum ReplacedContentKind {
     Image(Option<Arc<Image>>),
     IFrame(IFrameInfo),
@@ -181,6 +182,10 @@ impl ReplacedContents {
             }
         };
 
+        if let ReplacedContentKind::Image(Some(ref image)) = kind {
+            context.handle_animated_image(element.opaque(), image.clone());
+        }
+
         let natural_size = if let Some(naturalc_size_in_dots) = natural_size_in_dots {
             // FIXME: should 'image-resolution' (when implemented) be used *instead* of
             // `script::dom::htmlimageelement::ImageRequest::current_pixel_density`?
@@ -215,7 +220,7 @@ impl ReplacedContents {
                 Some(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
                     (Some(image.clone()), image.width as f32, image.height as f32)
                 },
-                Some(ImageOrMetadataAvailable::MetadataAvailable(metadata)) => {
+                Some(ImageOrMetadataAvailable::MetadataAvailable(metadata, _id)) => {
                     (None, metadata.width as f32, metadata.height as f32)
                 },
                 None => return None,
@@ -278,31 +283,9 @@ impl ReplacedContents {
         }
     }
 
-    pub fn inline_content_sizes(
-        &self,
-        _: &LayoutContext,
-        constraint_space: &ConstraintSpace,
-    ) -> InlineContentSizesResult {
-        let get_inline_fallback_size = || {
-            let writing_mode = constraint_space.writing_mode;
-            self.flow_relative_natural_size(writing_mode)
-                .inline
-                .unwrap_or_else(|| Self::flow_relative_default_object_size(writing_mode).inline)
-        };
-        let inline_content_size = self.content_size(
-            Direction::Inline,
-            constraint_space.preferred_aspect_ratio,
-            &|| constraint_space.block_size,
-            &get_inline_fallback_size,
-        );
-        InlineContentSizesResult {
-            sizes: inline_content_size.into(),
-            depends_on_block_constraints: constraint_space.preferred_aspect_ratio.is_some(),
-        }
-    }
-
     pub fn make_fragments(
         &self,
+        layout_context: &LayoutContext,
         style: &ServoArc<ComputedValues>,
         size: PhysicalSize<Au>,
     ) -> Vec<Fragment> {
@@ -354,31 +337,41 @@ impl ReplacedContents {
                 .as_ref()
                 .and_then(|image| image.id)
                 .map(|image_key| {
-                    Fragment::Image(ImageFragment {
+                    Fragment::Image(ArcRefCell::new(ImageFragment {
                         base: self.base_fragment_info.into(),
                         style: style.clone(),
                         rect,
                         clip,
                         image_key: Some(image_key),
-                    })
+                    }))
                 })
                 .into_iter()
                 .collect(),
-            ReplacedContentKind::Video(video) => vec![Fragment::Image(ImageFragment {
-                base: self.base_fragment_info.into(),
-                style: style.clone(),
-                rect,
-                clip,
-                image_key: video.as_ref().map(|video| video.image_key),
-            })],
+            ReplacedContentKind::Video(video) => {
+                vec![Fragment::Image(ArcRefCell::new(ImageFragment {
+                    base: self.base_fragment_info.into(),
+                    style: style.clone(),
+                    rect,
+                    clip,
+                    image_key: video.as_ref().map(|video| video.image_key),
+                }))]
+            },
             ReplacedContentKind::IFrame(iframe) => {
-                vec![Fragment::IFrame(IFrameFragment {
+                let size = Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px());
+                layout_context.iframe_sizes.lock().insert(
+                    iframe.browsing_context_id,
+                    IFrameSize {
+                        browsing_context_id: iframe.browsing_context_id,
+                        pipeline_id: iframe.pipeline_id,
+                        size,
+                    },
+                );
+                vec![Fragment::IFrame(ArcRefCell::new(IFrameFragment {
                     base: self.base_fragment_info.into(),
                     style: style.clone(),
                     pipeline_id: iframe.pipeline_id,
-                    browsing_context_id: iframe.browsing_context_id,
                     rect,
-                })]
+                }))]
             },
             ReplacedContentKind::Canvas(canvas_info) => {
                 if self.natural_size.width == Some(Au::zero()) ||
@@ -390,26 +383,16 @@ impl ReplacedContents {
                 let image_key = match canvas_info.source {
                     CanvasSource::WebGL(image_key) => image_key,
                     CanvasSource::WebGPU(image_key) => image_key,
-                    CanvasSource::Image(ref ipc_renderer) => {
-                        let ipc_renderer = ipc_renderer.lock().unwrap();
-                        let (sender, receiver) = ipc::channel().unwrap();
-                        ipc_renderer
-                            .send(CanvasMsg::FromLayout(
-                                FromLayoutMsg::SendData(sender),
-                                canvas_info.canvas_id,
-                            ))
-                            .unwrap();
-                        receiver.recv().unwrap().image_key
-                    },
+                    CanvasSource::Image(image_key) => image_key,
                     CanvasSource::Empty => return vec![],
                 };
-                vec![Fragment::Image(ImageFragment {
+                vec![Fragment::Image(ArcRefCell::new(ImageFragment {
                     base: self.base_fragment_info.into(),
                     style: style.clone(),
                     rect,
                     clip,
                     image_key: Some(image_key),
-                })]
+                }))]
             },
         }
     }
@@ -444,16 +427,16 @@ impl ReplacedContents {
         containing_block: &ContainingBlock,
         style: &ComputedValues,
         content_box_sizes_and_pbm: &ContentBoxSizesAndPBM,
+        ignore_block_margins_for_stretch: LogicalSides1D<bool>,
     ) -> LogicalVec2<Au> {
         let pbm = &content_box_sizes_and_pbm.pbm;
         self.used_size_as_if_inline_element_from_content_box_sizes(
             containing_block,
             style,
             self.preferred_aspect_ratio(style, &pbm.padding_border_sums),
-            content_box_sizes_and_pbm.content_box_size,
-            content_box_sizes_and_pbm.content_min_box_size,
-            content_box_sizes_and_pbm.content_max_box_size,
-            pbm.padding_border_sums + pbm.margin.auto_is(Au::zero).sum(),
+            content_box_sizes_and_pbm.content_box_sizes.as_ref(),
+            Size::FitContent.into(),
+            pbm.sums_auto_is_zero(ignore_block_margins_for_stretch),
         )
     }
 
@@ -492,15 +475,13 @@ impl ReplacedContents {
     ///
     /// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-size-transfers>
     /// <https://github.com/w3c/csswg-drafts/issues/6071#issuecomment-2243986313>
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn used_size_as_if_inline_element_from_content_box_sizes(
         &self,
         containing_block: &ContainingBlock,
         style: &ComputedValues,
         preferred_aspect_ratio: Option<AspectRatio>,
-        box_size: LogicalVec2<Size<Au>>,
-        min_box_size: LogicalVec2<Size<Au>>,
-        max_box_size: LogicalVec2<Size<Au>>,
+        sizes: LogicalVec2<&Sizes>,
+        automatic_size: LogicalVec2<Size<Au>>,
         pbm_sums: LogicalVec2<Au>,
     ) -> LogicalVec2<Au> {
         // <https://drafts.csswg.org/css-images-3/#natural-dimensions>
@@ -521,30 +502,21 @@ impl ReplacedContents {
         };
 
         // <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing>
-        let inline_stretch_size = Au::zero().max(containing_block.inline_size - pbm_sums.inline);
+        let inline_stretch_size = Au::zero().max(containing_block.size.inline - pbm_sums.inline);
         let block_stretch_size = containing_block
-            .block_size
-            .non_auto()
+            .size
+            .block
+            .to_definite()
             .map(|block_size| Au::zero().max(block_size - pbm_sums.block));
 
         // First, compute the inline size. Intrinsic values depend on the block sizing properties
         // through the aspect ratio, but these can also be intrinsic and depend on the inline size.
         // Therefore, we tentatively treat intrinsic block sizing properties as their initial value.
-        let inline_content_size = LazyCell::new(|| {
+        let get_inline_content_size = || {
             let get_block_size = || {
-                let block_stretch_size = block_stretch_size.unwrap_or_else(get_block_fallback_size);
-                SizeConstraint::new(
-                    box_size
-                        .block
-                        .maybe_resolve_extrinsic(Some(block_stretch_size)),
-                    min_box_size
-                        .block
-                        .maybe_resolve_extrinsic(Some(block_stretch_size))
-                        .unwrap_or_default(),
-                    max_box_size
-                        .block
-                        .maybe_resolve_extrinsic(Some(block_stretch_size)),
-                )
+                sizes
+                    .block
+                    .resolve_extrinsic(automatic_size.block, Au::zero(), block_stretch_size)
             };
             self.content_size(
                 Direction::Inline,
@@ -553,31 +525,19 @@ impl ReplacedContents {
                 &get_inline_fallback_size,
             )
             .into()
-        });
-        let preferred_inline =
-            box_size
-                .inline
-                .resolve(Size::FitContent, inline_stretch_size, &inline_content_size);
-        let min_inline = min_box_size
-            .inline
-            .resolve_non_initial(inline_stretch_size, &inline_content_size)
-            .unwrap_or_default();
-        let max_inline = max_box_size
-            .inline
-            .resolve_non_initial(inline_stretch_size, &inline_content_size);
-        let inline_size = preferred_inline.clamp_between_extremums(min_inline, max_inline);
+        };
+        let inline_size = sizes.inline.resolve(
+            Direction::Inline,
+            automatic_size.inline,
+            Au::zero,
+            Some(inline_stretch_size),
+            get_inline_content_size,
+            false, /* is_table */
+        );
 
         // Now we can compute the block size, using the inline size from above.
         let block_content_size = LazyCell::new(|| -> ContentSizes {
-            let get_inline_size = || {
-                if box_size.inline.is_initial() {
-                    // TODO: do we really need to special-case `auto`?
-                    // https://github.com/w3c/csswg-drafts/issues/11236
-                    SizeConstraint::MinMax(min_inline, max_inline)
-                } else {
-                    SizeConstraint::Definite(inline_size)
-                }
-            };
+            let get_inline_size = || SizeConstraint::Definite(inline_size);
             self.content_size(
                 Direction::Block,
                 preferred_aspect_ratio,
@@ -586,24 +546,48 @@ impl ReplacedContents {
             )
             .into()
         });
-        let block_stretch_size =
-            block_stretch_size.unwrap_or_else(|| block_content_size.max_content);
-        let preferred_block =
-            box_size
-                .block
-                .resolve(Size::FitContent, block_stretch_size, &block_content_size);
-        let min_block = min_box_size
-            .block
-            .resolve_non_initial(block_stretch_size, &block_content_size)
-            .unwrap_or_default();
-        let max_block = max_box_size
-            .block
-            .resolve_non_initial(block_stretch_size, &block_content_size);
-        let block_size = preferred_block.clamp_between_extremums(min_block, max_block);
+        let block_size = sizes.block.resolve(
+            Direction::Block,
+            automatic_size.block,
+            Au::zero,
+            block_stretch_size,
+            || *block_content_size,
+            false, /* is_table */
+        );
 
         LogicalVec2 {
             inline: inline_size,
             block: block_size,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn layout_style<'a>(&self, base: &'a LayoutBoxBase) -> LayoutStyle<'a> {
+        LayoutStyle::Default(&base.style)
+    }
+}
+
+impl ComputeInlineContentSizes for ReplacedContents {
+    fn compute_inline_content_sizes(
+        &self,
+        _: &LayoutContext,
+        constraint_space: &ConstraintSpace,
+    ) -> InlineContentSizesResult {
+        let get_inline_fallback_size = || {
+            let writing_mode = constraint_space.writing_mode;
+            self.flow_relative_natural_size(writing_mode)
+                .inline
+                .unwrap_or_else(|| Self::flow_relative_default_object_size(writing_mode).inline)
+        };
+        let inline_content_size = self.content_size(
+            Direction::Inline,
+            constraint_space.preferred_aspect_ratio,
+            &|| constraint_space.block_size,
+            &get_inline_fallback_size,
+        );
+        InlineContentSizesResult {
+            sizes: inline_content_size.into(),
+            depends_on_block_constraints: constraint_space.preferred_aspect_ratio.is_some(),
         }
     }
 }

@@ -5,12 +5,12 @@ mod layout;
 mod stylo_taffy;
 use std::fmt;
 
-use serde::Serialize;
+use app_units::Au;
 use servo_arc::Arc;
 use style::properties::ComputedValues;
-use style::values::computed::TextDecorationLine;
 use stylo_taffy::TaffyStyloStyle;
 
+use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
 use crate::context::LayoutContext;
@@ -20,10 +20,9 @@ use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::Fragment;
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct TaffyContainer {
     children: Vec<ArcRefCell<TaffyItemBox>>,
-    #[serde(skip_serializing)]
     style: Arc<ComputedValues>,
 }
 
@@ -32,11 +31,10 @@ impl TaffyContainer {
         context: &LayoutContext,
         info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
         contents: NonReplacedContents,
-        propagated_text_decoration_line: TextDecorationLine,
+        propagated_data: PropagatedBoxTreeData,
     ) -> Self {
-        let text_decoration_line =
-            propagated_text_decoration_line | info.style.clone_text_decoration_line();
-        let mut builder = ModernContainerBuilder::new(context, info, text_decoration_line);
+        let mut builder =
+            ModernContainerBuilder::new(context, info, propagated_data.union(&info.style));
         contents.traverse(context, info, &mut builder);
         let items = builder.finish();
 
@@ -71,19 +69,15 @@ impl TaffyContainer {
     }
 }
 
-#[derive(Serialize)]
 pub(crate) struct TaffyItemBox {
-    pub(crate) taffy_layout_cache: taffy::Cache,
     pub(crate) taffy_layout: taffy::Layout,
     pub(crate) child_fragments: Vec<Fragment>,
-    #[serde(skip_serializing)]
     pub(crate) positioning_context: PositioningContext,
-    #[serde(skip_serializing)]
     pub(crate) style: Arc<ComputedValues>,
     pub(crate) taffy_level_box: TaffyItemBoxInner,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) enum TaffyItemBoxInner {
     InFlowBox(IndependentFormattingContext),
     OutOfFlowAbsolutelyPositionedBox(ArcRefCell<AbsolutelyPositionedBox>),
@@ -92,7 +86,6 @@ pub(crate) enum TaffyItemBoxInner {
 impl fmt::Debug for TaffyItemBox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaffyItemBox")
-            .field("taffy_layout_cache", &self.taffy_layout_cache)
             .field("taffy_layout", &self.taffy_layout)
             .field("child_fragments", &self.child_fragments.len())
             .field("style", &self.style)
@@ -111,7 +104,6 @@ impl TaffyItemBox {
         };
 
         Self {
-            taffy_layout_cache: Default::default(),
             taffy_layout: Default::default(),
             child_fragments: Vec::new(),
             positioning_context: PositioningContext::new_for_containing_block_for_all_descendants(),
@@ -119,4 +111,39 @@ impl TaffyItemBox {
             taffy_level_box: inner,
         }
     }
+}
+
+/// Details from Taffy grid layout that will be stored
+#[derive(Clone, Debug)]
+pub(crate) struct SpecificTaffyGridInfo {
+    pub rows: SpecificTaffyGridTrackInfo,
+    pub columns: SpecificTaffyGridTrackInfo,
+}
+
+impl SpecificTaffyGridInfo {
+    fn from_detailed_grid_layout(grid_info: taffy::DetailedGridInfo) -> Self {
+        Self {
+            rows: SpecificTaffyGridTrackInfo {
+                sizes: grid_info
+                    .rows
+                    .sizes
+                    .iter()
+                    .map(|size| Au::from_f32_px(*size))
+                    .collect(),
+            },
+            columns: SpecificTaffyGridTrackInfo {
+                sizes: grid_info
+                    .columns
+                    .sizes
+                    .iter()
+                    .map(|size| Au::from_f32_px(*size))
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SpecificTaffyGridTrackInfo {
+    pub sizes: Box<[Au]>,
 }

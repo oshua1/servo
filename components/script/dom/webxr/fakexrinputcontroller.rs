@@ -9,6 +9,7 @@ use webxr_api::{
     SelectKind, TargetRayMode,
 };
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::FakeXRDeviceBinding::FakeXRRigidTransformInit;
 use crate::dom::bindings::codegen::Bindings::FakeXRInputControllerBinding::{
     FakeXRButtonStateInit, FakeXRButtonType, FakeXRInputControllerMethods,
@@ -17,14 +18,15 @@ use crate::dom::bindings::codegen::Bindings::XRInputSourceBinding::{
     XRHandedness, XRTargetRayMode,
 };
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::fakexrdevice::get_origin;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct FakeXRInputController {
+pub(crate) struct FakeXRInputController {
     reflector: Reflector,
     #[ignore_malloc_size_of = "defined in ipc-channel"]
     #[no_trace]
@@ -35,7 +37,10 @@ pub struct FakeXRInputController {
 }
 
 impl FakeXRInputController {
-    pub fn new_inherited(sender: IpcSender<MockDeviceMsg>, id: InputId) -> FakeXRInputController {
+    pub(crate) fn new_inherited(
+        sender: IpcSender<MockDeviceMsg>,
+        id: InputId,
+    ) -> FakeXRInputController {
         FakeXRInputController {
             reflector: Reflector::new(),
             sender,
@@ -43,14 +48,16 @@ impl FakeXRInputController {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         sender: IpcSender<MockDeviceMsg>,
         id: InputId,
+        can_gc: CanGc,
     ) -> DomRoot<FakeXRInputController> {
         reflect_dom_object(
             Box::new(FakeXRInputController::new_inherited(sender, id)),
             global,
+            can_gc,
         )
     }
 
@@ -165,9 +172,9 @@ impl FakeXRInputControllerMethods<crate::DomTypeHolder> for FakeXRInputControlle
     }
 }
 
-impl From<FakeXRButtonType> for MockButtonType {
-    fn from(b: FakeXRButtonType) -> Self {
-        match b {
+impl Convert<MockButtonType> for FakeXRButtonType {
+    fn convert(self) -> MockButtonType {
+        match self {
             FakeXRButtonType::Grip => MockButtonType::Grip,
             FakeXRButtonType::Touchpad => MockButtonType::Touchpad,
             FakeXRButtonType::Thumbstick => MockButtonType::Thumbstick,
@@ -178,11 +185,11 @@ impl From<FakeXRButtonType> for MockButtonType {
 }
 
 /// <https://immersive-web.github.io/webxr-test-api/#parse-supported-buttons>
-pub fn init_to_mock_buttons(buttons: &[FakeXRButtonStateInit]) -> Vec<MockButton> {
+pub(crate) fn init_to_mock_buttons(buttons: &[FakeXRButtonStateInit]) -> Vec<MockButton> {
     let supported: Vec<MockButton> = buttons
         .iter()
         .map(|b| MockButton {
-            button_type: b.buttonType.into(),
+            button_type: b.buttonType.convert(),
             pressed: b.pressed,
             touched: b.touched,
             pressed_value: *b.pressedValue,

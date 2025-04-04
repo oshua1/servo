@@ -15,6 +15,7 @@ use webxr_api::{
     MockViewInit, MockViewsInit, MockWorld, TargetRayMode, Triangle, Visibility,
 };
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::DOMPointInit;
 use crate::dom::bindings::codegen::Bindings::FakeXRDeviceBinding::{
     FakeXRBoundsPoint, FakeXRDeviceMethods, FakeXRRegionType, FakeXRRigidTransformInit,
@@ -28,16 +29,15 @@ use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRVisibilityState
 use crate::dom::bindings::codegen::Bindings::XRViewBinding::XREye;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::fakexrinputcontroller::{init_to_mock_buttons, FakeXRInputController};
+use crate::dom::fakexrinputcontroller::{FakeXRInputController, init_to_mock_buttons};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::script_runtime::CanGc;
-use crate::task_source::TaskSource;
 
 #[dom_struct]
-pub struct FakeXRDevice {
+pub(crate) struct FakeXRDevice {
     reflector: Reflector,
     #[ignore_malloc_size_of = "defined in ipc-channel"]
     #[no_trace]
@@ -48,7 +48,7 @@ pub struct FakeXRDevice {
 }
 
 impl FakeXRDevice {
-    pub fn new_inherited(sender: IpcSender<MockDeviceMsg>) -> FakeXRDevice {
+    pub(crate) fn new_inherited(sender: IpcSender<MockDeviceMsg>) -> FakeXRDevice {
         FakeXRDevice {
             reflector: Reflector::new(),
             sender,
@@ -56,16 +56,24 @@ impl FakeXRDevice {
         }
     }
 
-    pub fn new(global: &GlobalScope, sender: IpcSender<MockDeviceMsg>) -> DomRoot<FakeXRDevice> {
-        reflect_dom_object(Box::new(FakeXRDevice::new_inherited(sender)), global)
+    pub(crate) fn new(
+        global: &GlobalScope,
+        sender: IpcSender<MockDeviceMsg>,
+        can_gc: CanGc,
+    ) -> DomRoot<FakeXRDevice> {
+        reflect_dom_object(
+            Box::new(FakeXRDevice::new_inherited(sender)),
+            global,
+            can_gc,
+        )
     }
 
-    pub fn disconnect(&self, sender: IpcSender<()>) {
+    pub(crate) fn disconnect(&self, sender: IpcSender<()>) {
         let _ = self.sender.send(MockDeviceMsg::Disconnect(sender));
     }
 }
 
-pub fn view<Eye>(view: &FakeXRViewInit) -> Fallible<MockViewInit<Eye>> {
+pub(crate) fn view<Eye>(view: &FakeXRViewInit) -> Fallible<MockViewInit<Eye>> {
     if view.projectionMatrix.len() != 16 || view.viewOffset.position.len() != 3 {
         return Err(Error::Type("Incorrectly sized array".into()));
     }
@@ -102,7 +110,7 @@ pub fn view<Eye>(view: &FakeXRViewInit) -> Fallible<MockViewInit<Eye>> {
     })
 }
 
-pub fn get_views(views: &[FakeXRViewInit]) -> Fallible<MockViewsInit> {
+pub(crate) fn get_views(views: &[FakeXRViewInit]) -> Fallible<MockViewsInit> {
     match views.len() {
         1 => Ok(MockViewsInit::Mono(view(&views[0])?)),
         2 => {
@@ -117,7 +125,7 @@ pub fn get_views(views: &[FakeXRViewInit]) -> Fallible<MockViewsInit> {
     }
 }
 
-pub fn get_origin<T, U>(
+pub(crate) fn get_origin<T, U>(
     origin: &FakeXRRigidTransformInit,
 ) -> Fallible<RigidTransform3D<f32, T, U>> {
     if origin.position.len() != 3 || origin.orientation.len() != 4 {
@@ -138,16 +146,16 @@ pub fn get_origin<T, U>(
     Ok(RigidTransform3D::new(o, p))
 }
 
-pub fn get_point<T>(pt: &DOMPointInit) -> Point3D<f32, T> {
+pub(crate) fn get_point<T>(pt: &DOMPointInit) -> Point3D<f32, T> {
     Point3D::new(pt.x / pt.w, pt.y / pt.w, pt.z / pt.w).cast()
 }
 
-pub fn get_world(world: &FakeXRWorldInit) -> Fallible<MockWorld> {
+pub(crate) fn get_world(world: &FakeXRWorldInit) -> Fallible<MockWorld> {
     let regions = world
         .hitTestRegions
         .iter()
         .map(|region| {
-            let ty = region.type_.into();
+            let ty = region.type_.convert();
             let faces = region
                 .faces
                 .iter()
@@ -172,9 +180,9 @@ pub fn get_world(world: &FakeXRWorldInit) -> Fallible<MockWorld> {
     Ok(MockWorld { regions })
 }
 
-impl From<FakeXRRegionType> for EntityType {
-    fn from(x: FakeXRRegionType) -> Self {
-        match x {
+impl Convert<EntityType> for FakeXRRegionType {
+    fn convert(self) -> EntityType {
+        match self {
             FakeXRRegionType::Point => EntityType::Point,
             FakeXRRegionType::Plane => EntityType::Plane,
             FakeXRRegionType::Mesh => EntityType::Mesh,
@@ -255,8 +263,8 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
         let id = self.next_input_id.get();
         self.next_input_id.set(InputId(id.0 + 1));
 
-        let handedness = init.handedness.into();
-        let target_ray_mode = init.targetRayMode.into();
+        let handedness = init.handedness.convert();
+        let target_ray_mode = init.targetRayMode.convert();
 
         let pointer_origin = Some(get_origin(&init.pointerOrigin)?);
 
@@ -292,7 +300,8 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
         let global = self.global();
         let _ = self.sender.send(MockDeviceMsg::AddInputSource(init));
 
-        let controller = FakeXRInputController::new(&global, self.sender.clone(), id);
+        let controller =
+            FakeXRInputController::new(&global, self.sender.clone(), id, CanGc::note());
 
         Ok(controller)
     }
@@ -302,10 +311,10 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
         let global = self.global();
         let p = Promise::new(&global, can_gc);
         let mut trusted = Some(TrustedPromise::new(p.clone()));
-        let (task_source, canceller) = global
-            .as_window()
+        let task_source = global
             .task_manager()
-            .dom_manipulation_task_source_with_canceller();
+            .dom_manipulation_task_source()
+            .to_sendable();
         let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
         ROUTER.add_typed_route(
@@ -314,7 +323,7 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
                 let trusted = trusted
                     .take()
                     .expect("disconnect callback called multiple times");
-                let _ = task_source.queue_with_canceller(trusted.resolve_task(()), &canceller);
+                task_source.queue(trusted.resolve_task(()));
             }),
         );
         self.disconnect(sender);
@@ -346,9 +355,9 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
     }
 }
 
-impl From<XRHandedness> for Handedness {
-    fn from(h: XRHandedness) -> Self {
-        match h {
+impl Convert<Handedness> for XRHandedness {
+    fn convert(self) -> Handedness {
+        match self {
             XRHandedness::None => Handedness::None,
             XRHandedness::Left => Handedness::Left,
             XRHandedness::Right => Handedness::Right,
@@ -356,9 +365,9 @@ impl From<XRHandedness> for Handedness {
     }
 }
 
-impl From<XRTargetRayMode> for TargetRayMode {
-    fn from(t: XRTargetRayMode) -> Self {
-        match t {
+impl Convert<TargetRayMode> for XRTargetRayMode {
+    fn convert(self) -> TargetRayMode {
+        match self {
             XRTargetRayMode::Gaze => TargetRayMode::Gaze,
             XRTargetRayMode::Tracked_pointer => TargetRayMode::TrackedPointer,
             XRTargetRayMode::Screen => TargetRayMode::Screen,

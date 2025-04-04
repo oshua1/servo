@@ -3,15 +3,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use webgpu::{wgt, RenderCommand, WebGPU, WebGPURenderPass, WebGPURequest};
+use webgpu::{RenderCommand, WebGPU, WebGPURenderPass, WebGPURequest, wgt};
 
+use crate::conversions::TryConvert;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUColor, GPUIndexFormat, GPURenderPassEncoderMethods,
 };
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
@@ -20,9 +21,10 @@ use crate::dom::webgpu::gpubuffer::GPUBuffer;
 use crate::dom::webgpu::gpucommandencoder::GPUCommandEncoder;
 use crate::dom::webgpu::gpurenderbundle::GPURenderBundle;
 use crate::dom::webgpu::gpurenderpipeline::GPURenderPipeline;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct GPURenderPassEncoder {
+pub(crate) struct GPURenderPassEncoder {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "defined in webgpu"]
     #[no_trace]
@@ -49,12 +51,13 @@ impl GPURenderPassEncoder {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         channel: WebGPU,
         render_pass: WebGPURenderPass,
         parent: &GPUCommandEncoder,
         label: USVString,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPURenderPassEncoder::new_inherited(
@@ -64,6 +67,7 @@ impl GPURenderPassEncoder {
                 label,
             )),
             global,
+            can_gc,
         )
     }
 
@@ -130,7 +134,7 @@ impl GPURenderPassEncoderMethods<crate::DomTypeHolder> for GPURenderPassEncoder 
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpurenderpassencoder-setblendcolor>
     fn SetBlendConstant(&self, color: GPUColor) -> Fallible<()> {
-        self.send_render_command(RenderCommand::SetBlendConstant((&color).try_into()?));
+        self.send_render_command(RenderCommand::SetBlendConstant((&color).try_convert()?));
         Ok(())
     }
 

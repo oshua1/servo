@@ -8,15 +8,16 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use servo_media::streams::registry::MediaStreamId;
+use servo_media::ServoMedia;
 use servo_media::streams::MediaStreamType;
+use servo_media::streams::registry::MediaStreamId;
 use servo_media::webrtc::{
     BundlePolicy, DataChannelEvent, DataChannelId, DataChannelState, GatheringState, IceCandidate,
     IceConnectionState, SdpType, SessionDescription, SignalingState, WebRtcController,
     WebRtcSignaller,
 };
-use servo_media::ServoMedia;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::RTCDataChannelInit;
 use crate::dom::bindings::codegen::Bindings::RTCIceCandidateBinding::RTCIceCandidateInit;
@@ -32,12 +33,11 @@ use crate::dom::bindings::codegen::UnionTypes::{MediaStreamTrackOrString, String
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::USVString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::mediastream::MediaStream;
 use crate::dom::mediastreamtrack::MediaStreamTrack;
 use crate::dom::promise::Promise;
@@ -49,14 +49,12 @@ use crate::dom::rtcrtptransceiver::RTCRtpTransceiver;
 use crate::dom::rtcsessiondescription::RTCSessionDescription;
 use crate::dom::rtctrackevent::RTCTrackEvent;
 use crate::dom::window::Window;
-use crate::realms::{enter_realm, InRealm};
+use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
-use crate::task::TaskCanceller;
-use crate::task_source::networking::NetworkingTaskSource;
-use crate::task_source::TaskSource;
+use crate::task_source::SendableTaskSource;
 
 #[dom_struct]
-pub struct RTCPeerConnection {
+pub(crate) struct RTCPeerConnection {
     eventtarget: EventTarget,
     #[ignore_malloc_size_of = "defined in servo-media"]
     #[no_trace]
@@ -80,76 +78,61 @@ pub struct RTCPeerConnection {
 
 struct RTCSignaller {
     trusted: Trusted<RTCPeerConnection>,
-    task_source: NetworkingTaskSource,
-    canceller: TaskCanceller,
+    task_source: SendableTaskSource,
 }
 
 impl WebRtcSignaller for RTCSignaller {
     fn on_ice_candidate(&self, _: &WebRtcController, candidate: IceCandidate) {
         let this = self.trusted.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(on_ice_candidate: move || {
-                let this = this.root();
-                this.on_ice_candidate(candidate, CanGc::note());
-            }),
-            &self.canceller,
-        );
+        self.task_source.queue(task!(on_ice_candidate: move || {
+            let this = this.root();
+            this.on_ice_candidate(candidate, CanGc::note());
+        }));
     }
 
     fn on_negotiation_needed(&self, _: &WebRtcController) {
         let this = self.trusted.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(on_negotiation_needed: move || {
+        self.task_source
+            .queue(task!(on_negotiation_needed: move || {
                 let this = this.root();
                 this.on_negotiation_needed(CanGc::note());
-            }),
-            &self.canceller,
-        );
+            }));
     }
 
     fn update_gathering_state(&self, state: GatheringState) {
         let this = self.trusted.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(update_gathering_state: move || {
+        self.task_source
+            .queue(task!(update_gathering_state: move || {
                 let this = this.root();
                 this.update_gathering_state(state, CanGc::note());
-            }),
-            &self.canceller,
-        );
+            }));
     }
 
     fn update_ice_connection_state(&self, state: IceConnectionState) {
         let this = self.trusted.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(update_ice_connection_state: move || {
+        self.task_source
+            .queue(task!(update_ice_connection_state: move || {
                 let this = this.root();
                 this.update_ice_connection_state(state, CanGc::note());
-            }),
-            &self.canceller,
-        );
+            }));
     }
 
     fn update_signaling_state(&self, state: SignalingState) {
         let this = self.trusted.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(update_signaling_state: move || {
+        self.task_source
+            .queue(task!(update_signaling_state: move || {
                 let this = this.root();
                 this.update_signaling_state(state, CanGc::note());
-            }),
-            &self.canceller,
-        );
+            }));
     }
 
     fn on_add_stream(&self, id: &MediaStreamId, ty: MediaStreamType) {
         let this = self.trusted.clone();
         let id = *id;
-        let _ = self.task_source.queue_with_canceller(
-            task!(on_add_stream: move || {
-                let this = this.root();
-                this.on_add_stream(id, ty, CanGc::note());
-            }),
-            &self.canceller,
-        );
+        self.task_source.queue(task!(on_add_stream: move || {
+            let this = this.root();
+            this.on_add_stream(id, ty, CanGc::note());
+        }));
     }
 
     fn on_data_channel_event(
@@ -160,15 +143,13 @@ impl WebRtcSignaller for RTCSignaller {
     ) {
         // XXX(ferjm) get label and options from channel properties.
         let this = self.trusted.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(on_data_channel_event: move || {
+        self.task_source
+            .queue(task!(on_data_channel_event: move || {
                 let this = this.root();
                 let global = this.global();
                 let _ac = enter_realm(&*global);
                 this.on_data_channel_event(channel, event, CanGc::note());
-            }),
-            &self.canceller,
-        );
+            }));
     }
 
     fn close(&self) {
@@ -177,7 +158,7 @@ impl WebRtcSignaller for RTCSignaller {
 }
 
 impl RTCPeerConnection {
-    pub fn new_inherited() -> RTCPeerConnection {
+    pub(crate) fn new_inherited() -> RTCPeerConnection {
         RTCPeerConnection {
             eventtarget: EventTarget::new_inherited(),
             controller: DomRefCell::new(None),
@@ -195,19 +176,19 @@ impl RTCPeerConnection {
     }
 
     fn new(
-        global: &GlobalScope,
+        window: &Window,
         proto: Option<HandleObject>,
         config: &RTCConfiguration,
         can_gc: CanGc,
     ) -> DomRoot<RTCPeerConnection> {
         let this = reflect_dom_object_with_proto(
             Box::new(RTCPeerConnection::new_inherited()),
-            global,
+            window,
             proto,
             can_gc,
         );
         let signaller = this.make_signaller();
-        *this.controller.borrow_mut() = Some(ServoMedia::get().unwrap().create_webrtc(signaller));
+        *this.controller.borrow_mut() = Some(ServoMedia::get().create_webrtc(signaller));
         if let Some(ref servers) = config.iceServers {
             if let Some(server) = servers.first() {
                 let server = match server.urls {
@@ -231,21 +212,15 @@ impl RTCPeerConnection {
         this
     }
 
-    pub fn get_webrtc_controller(&self) -> &DomRefCell<Option<WebRtcController>> {
+    pub(crate) fn get_webrtc_controller(&self) -> &DomRefCell<Option<WebRtcController>> {
         &self.controller
     }
 
     fn make_signaller(&self) -> Box<dyn WebRtcSignaller> {
         let trusted = Trusted::new(self);
-        let (task_source, canceller) = self
-            .global()
-            .as_window()
-            .task_manager()
-            .networking_task_source_with_canceller();
         Box::new(RTCSignaller {
             trusted,
-            task_source,
-            canceller,
+            task_source: self.global().task_manager().networking_task_source().into(),
         })
     }
 
@@ -254,7 +229,7 @@ impl RTCPeerConnection {
             return;
         }
         let candidate = RTCIceCandidate::new(
-            &self.global(),
+            self.global().as_window(),
             candidate.candidate.into(),
             None,
             Some(candidate.sdp_mline_index as u16),
@@ -262,7 +237,7 @@ impl RTCPeerConnection {
             can_gc,
         );
         let event = RTCPeerConnectionIceEvent::new(
-            &self.global(),
+            self.global().as_window(),
             atom!("icecandidate"),
             Some(&candidate),
             None,
@@ -290,9 +265,15 @@ impl RTCPeerConnection {
         if self.closed.get() {
             return;
         }
-        let track = MediaStreamTrack::new(&self.global(), id, ty);
-        let event =
-            RTCTrackEvent::new(&self.global(), atom!("track"), false, false, &track, can_gc);
+        let track = MediaStreamTrack::new(&self.global(), id, ty, can_gc);
+        let event = RTCTrackEvent::new(
+            self.global().as_window(),
+            atom!("track"),
+            false,
+            false,
+            &track,
+            can_gc,
+        );
         event.upcast::<Event>().fire(self.upcast(), can_gc);
     }
 
@@ -314,10 +295,11 @@ impl RTCPeerConnection {
                     USVString::from("".to_owned()),
                     &RTCDataChannelInit::empty(),
                     Some(channel_id),
+                    can_gc,
                 );
 
                 let event = RTCDataChannelEvent::new(
-                    &self.global(),
+                    self.global().as_window(),
                     atom!("datachannel"),
                     false,
                     false,
@@ -349,7 +331,7 @@ impl RTCPeerConnection {
         };
     }
 
-    pub fn register_data_channel(&self, id: DataChannelId, channel: &RTCDataChannel) {
+    pub(crate) fn register_data_channel(&self, id: DataChannelId, channel: &RTCDataChannel) {
         if self
             .data_channels
             .borrow_mut()
@@ -360,7 +342,7 @@ impl RTCPeerConnection {
         }
     }
 
-    pub fn unregister_data_channel(&self, id: &DataChannelId) {
+    pub(crate) fn unregister_data_channel(&self, id: &DataChannelId) {
         self.data_channels.borrow_mut().remove(id);
     }
 
@@ -372,7 +354,7 @@ impl RTCPeerConnection {
         }
 
         // step 2 (state derivation already done by gstreamer)
-        let state: RTCIceGatheringState = state.into();
+        let state: RTCIceGatheringState = state.convert();
 
         // step 3
         if state == self.gathering_state.get() {
@@ -395,7 +377,7 @@ impl RTCPeerConnection {
         // step 6
         if state == RTCIceGatheringState::Complete {
             let event = RTCPeerConnectionIceEvent::new(
-                &self.global(),
+                self.global().as_window(),
                 atom!("icecandidate"),
                 None,
                 None,
@@ -414,7 +396,7 @@ impl RTCPeerConnection {
         }
 
         // step 2 (state derivation already done by gstreamer)
-        let state: RTCIceConnectionState = state.into();
+        let state: RTCIceConnectionState = state.convert();
 
         // step 3
         if state == self.ice_connection_state.get() {
@@ -440,7 +422,7 @@ impl RTCPeerConnection {
             return;
         }
 
-        let state: RTCSignalingState = state.into();
+        let state: RTCSignalingState = state.convert();
 
         if state == self.signaling_state.get() {
             return;
@@ -460,65 +442,59 @@ impl RTCPeerConnection {
 
     fn create_offer(&self) {
         let generation = self.offer_answer_generation.get();
-        let (task_source, canceller) = self
+        let task_source = self
             .global()
-            .as_window()
             .task_manager()
-            .networking_task_source_with_canceller();
+            .networking_task_source()
+            .to_sendable();
         let this = Trusted::new(self);
         self.controller
             .borrow_mut()
             .as_ref()
             .unwrap()
             .create_offer(Box::new(move |desc: SessionDescription| {
-                let _ = task_source.queue_with_canceller(
-                    task!(offer_created: move || {
-                        let this = this.root();
-                        if this.offer_answer_generation.get() != generation {
-                            // the state has changed since we last created the offer,
-                            // create a fresh one
-                            this.create_offer();
-                        } else {
-                            let init: RTCSessionDescriptionInit = desc.into();
-                            for promise in this.offer_promises.borrow_mut().drain(..) {
-                                promise.resolve_native(&init);
-                            }
+                task_source.queue(task!(offer_created: move || {
+                    let this = this.root();
+                    if this.offer_answer_generation.get() != generation {
+                        // the state has changed since we last created the offer,
+                        // create a fresh one
+                        this.create_offer();
+                    } else {
+                        let init: RTCSessionDescriptionInit = desc.convert();
+                        for promise in this.offer_promises.borrow_mut().drain(..) {
+                            promise.resolve_native(&init, CanGc::note());
                         }
-                    }),
-                    &canceller,
-                );
+                    }
+                }));
             }));
     }
 
     fn create_answer(&self) {
         let generation = self.offer_answer_generation.get();
-        let (task_source, canceller) = self
+        let task_source = self
             .global()
-            .as_window()
             .task_manager()
-            .networking_task_source_with_canceller();
+            .networking_task_source()
+            .to_sendable();
         let this = Trusted::new(self);
         self.controller
             .borrow_mut()
             .as_ref()
             .unwrap()
             .create_answer(Box::new(move |desc: SessionDescription| {
-                let _ = task_source.queue_with_canceller(
-                    task!(answer_created: move || {
-                        let this = this.root();
-                        if this.offer_answer_generation.get() != generation {
-                            // the state has changed since we last created the offer,
-                            // create a fresh one
-                            this.create_answer();
-                        } else {
-                            let init: RTCSessionDescriptionInit = desc.into();
-                            for promise in this.answer_promises.borrow_mut().drain(..) {
-                                promise.resolve_native(&init);
-                            }
+                task_source.queue(task!(answer_created: move || {
+                    let this = this.root();
+                    if this.offer_answer_generation.get() != generation {
+                        // the state has changed since we last created the offer,
+                        // create a fresh one
+                        this.create_answer();
+                    } else {
+                        let init: RTCSessionDescriptionInit = desc.convert();
+                        for promise in this.answer_promises.borrow_mut().drain(..) {
+                            promise.resolve_native(&init, CanGc::note());
                         }
-                    }),
-                    &canceller,
-                );
+                    }
+                }));
             }));
     }
 }
@@ -531,12 +507,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         can_gc: CanGc,
         config: &RTCConfiguration,
     ) -> Fallible<DomRoot<RTCPeerConnection>> {
-        Ok(RTCPeerConnection::new(
-            &window.global(),
-            proto,
-            config,
-            can_gc,
-        ))
+        Ok(RTCPeerConnection::new(window, proto, config, can_gc))
     }
 
     // https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-icecandidate
@@ -585,17 +556,19 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
     ) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
         if candidate.sdpMid.is_none() && candidate.sdpMLineIndex.is_none() {
-            p.reject_error(Error::Type(
-                "one of sdpMid and sdpMLineIndex must be set".to_string(),
-            ));
+            p.reject_error(
+                Error::Type("one of sdpMid and sdpMLineIndex must be set".to_string()),
+                can_gc,
+            );
             return p;
         }
 
         // XXXManishearth add support for sdpMid
         if candidate.sdpMLineIndex.is_none() {
-            p.reject_error(Error::Type(
-                "servo only supports sdpMLineIndex right now".to_string(),
-            ));
+            p.reject_error(
+                Error::Type("servo only supports sdpMLineIndex right now".to_string()),
+                can_gc,
+            );
             return p;
         }
 
@@ -612,7 +585,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             });
 
         // XXXManishearth add_ice_candidate should have a callback
-        p.resolve_native(&());
+        p.resolve_native(&(), can_gc);
         p
     }
 
@@ -620,7 +593,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
     fn CreateOffer(&self, _options: &RTCOfferOptions, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
         if self.closed.get() {
-            p.reject_error(Error::InvalidState);
+            p.reject_error(Error::InvalidState, can_gc);
             return p;
         }
         self.offer_promises.borrow_mut().push(p.clone());
@@ -637,7 +610,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
     ) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
         if self.closed.get() {
-            p.reject_error(Error::InvalidState);
+            p.reject_error(Error::InvalidState, can_gc);
             return p;
         }
         self.answer_promises.borrow_mut().push(p.clone());
@@ -665,13 +638,13 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         // XXXManishearth validate the current state
         let p = Promise::new_in_current_realm(comp, can_gc);
         let this = Trusted::new(self);
-        let desc: SessionDescription = desc.into();
+        let desc: SessionDescription = desc.convert();
         let trusted_promise = TrustedPromise::new(p.clone());
-        let (task_source, canceller) = self
+        let task_source = self
             .global()
-            .as_window()
             .task_manager()
-            .networking_task_source_with_canceller();
+            .networking_task_source()
+            .to_sendable();
         self.controller
             .borrow_mut()
             .as_ref()
@@ -679,23 +652,20 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             .set_local_description(
                 desc.clone(),
                 Box::new(move || {
-                    let _ = task_source.queue_with_canceller(
-                        task!(local_description_set: move || {
-                            // XXXManishearth spec actually asks for an intricate
-                            // dance between pending/current local/remote descriptions
-                            let this = this.root();
-                            let desc = desc.into();
-                            let desc = RTCSessionDescription::Constructor(
-                                this.global().as_window(),
-                                None,
-                                CanGc::note(),
-                                &desc,
-                            ).unwrap();
-                            this.local_description.set(Some(&desc));
-                            trusted_promise.root().resolve_native(&())
-                        }),
-                        &canceller,
-                    );
+                    task_source.queue(task!(local_description_set: move || {
+                        // XXXManishearth spec actually asks for an intricate
+                        // dance between pending/current local/remote descriptions
+                        let this = this.root();
+                        let desc = desc.convert();
+                        let desc = RTCSessionDescription::Constructor(
+                            this.global().as_window(),
+                            None,
+                            CanGc::note(),
+                            &desc,
+                        ).unwrap();
+                        this.local_description.set(Some(&desc));
+                        trusted_promise.root().resolve_native(&(), CanGc::note())
+                    }));
                 }),
             );
         p
@@ -711,13 +681,13 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         // XXXManishearth validate the current state
         let p = Promise::new_in_current_realm(comp, can_gc);
         let this = Trusted::new(self);
-        let desc: SessionDescription = desc.into();
+        let desc: SessionDescription = desc.convert();
         let trusted_promise = TrustedPromise::new(p.clone());
-        let (task_source, canceller) = self
+        let task_source = self
             .global()
-            .as_window()
             .task_manager()
-            .networking_task_source_with_canceller();
+            .networking_task_source()
+            .to_sendable();
         self.controller
             .borrow_mut()
             .as_ref()
@@ -725,23 +695,20 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             .set_remote_description(
                 desc.clone(),
                 Box::new(move || {
-                    let _ = task_source.queue_with_canceller(
-                        task!(remote_description_set: move || {
-                            // XXXManishearth spec actually asks for an intricate
-                            // dance between pending/current local/remote descriptions
-                            let this = this.root();
-                            let desc = desc.into();
-                            let desc = RTCSessionDescription::Constructor(
-                                this.global().as_window(),
-                                None,
-                                CanGc::note(),
-                                &desc,
-                            ).unwrap();
-                            this.remote_description.set(Some(&desc));
-                            trusted_promise.root().resolve_native(&())
-                        }),
-                        &canceller,
-                    );
+                    task_source.queue(task!(remote_description_set: move || {
+                        // XXXManishearth spec actually asks for an intricate
+                        // dance between pending/current local/remote descriptions
+                        let this = this.root();
+                        let desc = desc.convert();
+                        let desc = RTCSessionDescription::Constructor(
+                            this.global().as_window(),
+                            None,
+                            CanGc::note(),
+                            &desc,
+                        ).unwrap();
+                        this.remote_description.set(Some(&desc));
+                        trusted_promise.root().resolve_native(&(), CanGc::note())
+                    }));
                 }),
             );
         p
@@ -809,7 +776,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         label: USVString,
         init: &RTCDataChannelInit,
     ) -> DomRoot<RTCDataChannel> {
-        RTCDataChannel::new(&self.global(), self, label, init, None)
+        RTCDataChannel::new(&self.global(), self, label, init, None, CanGc::note())
     }
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-addtransceiver>
@@ -818,13 +785,13 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         _track_or_kind: MediaStreamTrackOrString,
         init: &RTCRtpTransceiverInit,
     ) -> DomRoot<RTCRtpTransceiver> {
-        RTCRtpTransceiver::new(&self.global(), init.direction)
+        RTCRtpTransceiver::new(&self.global(), init.direction, CanGc::note())
     }
 }
 
-impl From<SessionDescription> for RTCSessionDescriptionInit {
-    fn from(desc: SessionDescription) -> Self {
-        let type_ = match desc.type_ {
+impl Convert<RTCSessionDescriptionInit> for SessionDescription {
+    fn convert(self) -> RTCSessionDescriptionInit {
+        let type_ = match self.type_ {
             SdpType::Answer => RTCSdpType::Answer,
             SdpType::Offer => RTCSdpType::Offer,
             SdpType::Pranswer => RTCSdpType::Pranswer,
@@ -832,14 +799,14 @@ impl From<SessionDescription> for RTCSessionDescriptionInit {
         };
         RTCSessionDescriptionInit {
             type_,
-            sdp: desc.sdp.into(),
+            sdp: self.sdp.into(),
         }
     }
 }
 
-impl<'a> From<&'a RTCSessionDescriptionInit> for SessionDescription {
-    fn from(desc: &'a RTCSessionDescriptionInit) -> Self {
-        let type_ = match desc.type_ {
+impl Convert<SessionDescription> for &RTCSessionDescriptionInit {
+    fn convert(self) -> SessionDescription {
+        let type_ = match self.type_ {
             RTCSdpType::Answer => SdpType::Answer,
             RTCSdpType::Offer => SdpType::Offer,
             RTCSdpType::Pranswer => SdpType::Pranswer,
@@ -847,14 +814,14 @@ impl<'a> From<&'a RTCSessionDescriptionInit> for SessionDescription {
         };
         SessionDescription {
             type_,
-            sdp: desc.sdp.to_string(),
+            sdp: self.sdp.to_string(),
         }
     }
 }
 
-impl From<GatheringState> for RTCIceGatheringState {
-    fn from(state: GatheringState) -> Self {
-        match state {
+impl Convert<RTCIceGatheringState> for GatheringState {
+    fn convert(self) -> RTCIceGatheringState {
+        match self {
             GatheringState::New => RTCIceGatheringState::New,
             GatheringState::Gathering => RTCIceGatheringState::Gathering,
             GatheringState::Complete => RTCIceGatheringState::Complete,
@@ -862,9 +829,9 @@ impl From<GatheringState> for RTCIceGatheringState {
     }
 }
 
-impl From<IceConnectionState> for RTCIceConnectionState {
-    fn from(state: IceConnectionState) -> Self {
-        match state {
+impl Convert<RTCIceConnectionState> for IceConnectionState {
+    fn convert(self) -> RTCIceConnectionState {
+        match self {
             IceConnectionState::New => RTCIceConnectionState::New,
             IceConnectionState::Checking => RTCIceConnectionState::Checking,
             IceConnectionState::Connected => RTCIceConnectionState::Connected,
@@ -876,9 +843,9 @@ impl From<IceConnectionState> for RTCIceConnectionState {
     }
 }
 
-impl From<SignalingState> for RTCSignalingState {
-    fn from(state: SignalingState) -> Self {
-        match state {
+impl Convert<RTCSignalingState> for SignalingState {
+    fn convert(self) -> RTCSignalingState {
+        match self {
             SignalingState::Stable => RTCSignalingState::Stable,
             SignalingState::HaveLocalOffer => RTCSignalingState::Have_local_offer,
             SignalingState::HaveRemoteOffer => RTCSignalingState::Have_remote_offer,

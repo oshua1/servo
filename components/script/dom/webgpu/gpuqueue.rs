@@ -6,16 +6,16 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSharedMemory;
-use webgpu::{wgt, WebGPU, WebGPUQueue, WebGPURequest, WebGPUResponse};
+use webgpu::{WebGPU, WebGPUQueue, WebGPURequest, wgt};
 
-use super::gpu::{response_async, AsyncWGPUListener};
+use crate::conversions::{Convert, TryConvert};
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUExtent3D, GPUImageCopyTexture, GPUImageDataLayout, GPUQueueMethods, GPUSize64,
 };
 use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer as BufferSource;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
@@ -23,10 +23,11 @@ use crate::dom::promise::Promise;
 use crate::dom::webgpu::gpubuffer::GPUBuffer;
 use crate::dom::webgpu::gpucommandbuffer::GPUCommandBuffer;
 use crate::dom::webgpu::gpudevice::GPUDevice;
+use crate::routed_promise::{RoutedPromiseListener, route_promise};
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct GPUQueue {
+pub(crate) struct GPUQueue {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "defined in webgpu"]
     #[no_trace]
@@ -48,17 +49,26 @@ impl GPUQueue {
         }
     }
 
-    pub fn new(global: &GlobalScope, channel: WebGPU, queue: WebGPUQueue) -> DomRoot<Self> {
-        reflect_dom_object(Box::new(GPUQueue::new_inherited(channel, queue)), global)
+    pub(crate) fn new(
+        global: &GlobalScope,
+        channel: WebGPU,
+        queue: WebGPUQueue,
+        can_gc: CanGc,
+    ) -> DomRoot<Self> {
+        reflect_dom_object(
+            Box::new(GPUQueue::new_inherited(channel, queue)),
+            global,
+            can_gc,
+        )
     }
 }
 
 impl GPUQueue {
-    pub fn set_device(&self, device: &GPUDevice) {
+    pub(crate) fn set_device(&self, device: &GPUDevice) {
         *self.device.borrow_mut() = Some(Dom::from_ref(device));
     }
 
-    pub fn id(&self) -> WebGPUQueue {
+    pub(crate) fn id(&self) -> WebGPUQueue {
         self.queue
     }
 }
@@ -162,9 +172,9 @@ impl GPUQueueMethods<crate::DomTypeHolder> for GPUQueue {
             return Err(Error::Operation);
         }
 
-        let texture_cv = destination.try_into()?;
-        let texture_layout = data_layout.into();
-        let write_size = (&size).try_into()?;
+        let texture_cv = destination.try_convert()?;
+        let texture_layout = data_layout.convert();
+        let write_size = (&size).try_convert()?;
         let final_data = IpcSharedMemory::from_bytes(&bytes);
 
         if let Err(e) = self.channel.0.send(WebGPURequest::WriteTexture {
@@ -190,7 +200,7 @@ impl GPUQueueMethods<crate::DomTypeHolder> for GPUQueue {
     fn OnSubmittedWorkDone(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
         let promise = Promise::new(&global, can_gc);
-        let sender = response_async(&promise, self);
+        let sender = route_promise(&promise, self);
         if let Err(e) = self
             .channel
             .0
@@ -205,21 +215,8 @@ impl GPUQueueMethods<crate::DomTypeHolder> for GPUQueue {
     }
 }
 
-impl AsyncWGPUListener for GPUQueue {
-    fn handle_response(
-        &self,
-        response: webgpu::WebGPUResponse,
-        promise: &Rc<Promise>,
-        _can_gc: CanGc,
-    ) {
-        match response {
-            WebGPUResponse::SubmittedWorkDone => {
-                promise.resolve_native(&());
-            },
-            _ => {
-                warn!("GPUQueue received wrong WebGPUResponse");
-                promise.reject_error(Error::Operation);
-            },
-        }
+impl RoutedPromiseListener<()> for GPUQueue {
+    fn handle_response(&self, _response: (), promise: &Rc<Promise>, can_gc: CanGc) {
+        promise.resolve_native(&(), can_gc);
     }
 }

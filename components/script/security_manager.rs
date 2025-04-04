@@ -5,16 +5,17 @@
 use js::jsapi::RuntimeCode;
 use net_traits::request::Referrer;
 use serde::Serialize;
-use servo_atoms::Atom;
 use servo_url::ServoUrl;
+use stylo_atoms::Atom;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
 use crate::dom::bindings::codegen::Bindings::SecurityPolicyViolationEventBinding::{
     SecurityPolicyViolationEventDisposition, SecurityPolicyViolationEventInit,
 };
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::securitypolicyviolationevent::SecurityPolicyViolationEvent;
@@ -22,7 +23,7 @@ use crate::dom::types::GlobalScope;
 use crate::script_runtime::CanGc;
 use crate::task::TaskOnce;
 
-pub struct CSPViolationReporter {
+pub(crate) struct CSPViolationReporter {
     sample: Option<String>,
     filename: String,
     report_only: bool,
@@ -34,7 +35,7 @@ pub struct CSPViolationReporter {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SecurityPolicyViolationReport {
+pub(crate) struct SecurityPolicyViolationReport {
     sample: Option<String>,
     #[serde(rename = "blockedURL")]
     blocked_url: String,
@@ -48,11 +49,12 @@ pub struct SecurityPolicyViolationReport {
     line_number: u32,
     column_number: u32,
     original_policy: String,
+    #[serde(serialize_with = "serialize_disposition")]
     disposition: SecurityPolicyViolationEventDisposition,
 }
 
 impl CSPViolationReporter {
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         sample: Option<String>,
         report_only: bool,
@@ -111,7 +113,7 @@ impl CSPViolationReporter {
             Atom::from("securitypolicyviolation"),
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
-            &report.into(),
+            &report.convert(),
             can_gc,
         );
 
@@ -149,31 +151,32 @@ impl TaskOnce for CSPViolationReporter {
     }
 }
 
-impl From<SecurityPolicyViolationReport> for SecurityPolicyViolationEventInit {
-    fn from(value: SecurityPolicyViolationReport) -> Self {
+impl Convert<SecurityPolicyViolationEventInit> for SecurityPolicyViolationReport {
+    fn convert(self) -> SecurityPolicyViolationEventInit {
         SecurityPolicyViolationEventInit {
-            sample: value.sample.unwrap_or_default().into(),
-            blockedURI: value.blocked_url.into(),
-            referrer: value.referrer.into(),
-            statusCode: value.status_code,
-            documentURI: value.document_url.into(),
-            sourceFile: value.source_file.into(),
-            violatedDirective: value.violated_directive.into(),
-            effectiveDirective: value.effective_directive.into(),
-            lineNumber: value.line_number,
-            columnNumber: value.column_number,
-            originalPolicy: value.original_policy.into(),
-            disposition: value.disposition,
+            sample: self.sample.unwrap_or_default().into(),
+            blockedURI: self.blocked_url.into(),
+            referrer: self.referrer.into(),
+            statusCode: self.status_code,
+            documentURI: self.document_url.into(),
+            sourceFile: self.source_file.into(),
+            violatedDirective: self.violated_directive.into(),
+            effectiveDirective: self.effective_directive.into(),
+            lineNumber: self.line_number,
+            columnNumber: self.column_number,
+            originalPolicy: self.original_policy.into(),
+            disposition: self.disposition,
             parent: EventInit::empty(),
         }
     }
 }
 
-impl Serialize for SecurityPolicyViolationEventDisposition {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Report => serializer.serialize_str("report"),
-            Self::Enforce => serializer.serialize_str("enforce"),
-        }
+fn serialize_disposition<S: serde::Serializer>(
+    val: &SecurityPolicyViolationEventDisposition,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match val {
+        SecurityPolicyViolationEventDisposition::Report => serializer.serialize_str("report"),
+        SecurityPolicyViolationEventDisposition::Enforce => serializer.serialize_str("enforce"),
     }
 }

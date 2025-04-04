@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
 #[cfg(not(windows))]
 use std::env;
 use std::ffi::OsStr;
@@ -23,7 +22,7 @@ use gaol::profile::{Operation, PathPattern, Profile};
 use ipc_channel::Error;
 use serde::{Deserialize, Serialize};
 use servo_config::opts::Opts;
-use servo_config::prefs::PrefValue;
+use servo_config::prefs::Preferences;
 
 use crate::pipeline::UnprivilegedPipelineContent;
 use crate::serviceworker::ServiceWorkerUnprivilegedContent;
@@ -43,7 +42,7 @@ impl UnprivilegedContent {
         }
     }
 
-    pub fn prefs(&self) -> HashMap<String, PrefValue> {
+    pub fn prefs(&self) -> &Preferences {
         match self {
             UnprivilegedContent::Pipeline(content) => content.prefs(),
             UnprivilegedContent::ServiceWorker(content) => content.prefs(),
@@ -158,6 +157,8 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
     let path_to_self = env::current_exe().expect("Failed to get current executor.");
     let mut child_process = process::Command::new(path_to_self);
     setup_common(&mut child_process, token);
+
+    #[allow(clippy::zombie_processes)]
     let _ = child_process
         .spawn()
         .expect("Failed to start unsandboxed child process!");
@@ -180,7 +181,10 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
     use gaol::sandbox::{self, Sandbox, SandboxMethods};
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 
-    impl CommandMethods for sandbox::Command {
+    // TODO: Move this impl out of the function. It is only currently here to avoid
+    // duplicating the feature flagging.
+    #[allow(non_local_definitions)]
+    impl CommandMethods for gaol::sandbox::Command {
         fn arg<T>(&mut self, arg: T)
         where
             T: AsRef<OsStr>,
@@ -216,6 +220,8 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
         let path_to_self = env::current_exe().expect("Failed to get current executor.");
         let mut child_process = process::Command::new(path_to_self);
         setup_common(&mut child_process, token);
+
+        #[allow(clippy::zombie_processes)]
         let _ = child_process
             .spawn()
             .expect("Failed to start unsandboxed child process!");
